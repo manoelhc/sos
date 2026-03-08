@@ -1,0 +1,19 @@
+[package]
+name = "sos"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+std = []
+
+[dependencies]
+spin = "0.9"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "sos"
+path = "src/bin/main.rs"
+required-features = []
