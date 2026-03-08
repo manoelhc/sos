@@ -1,6 +1,6 @@
-#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(all(not(feature = "std"), not(test), target_os = "none"), no_std)]
 
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test, not(target_os = "none")))]
 extern crate std;
 
 pub mod allocator;
@@ -11,7 +11,7 @@ pub use allocator::{BuddyAllocator, SlabAllocator};
 pub use framekernel::OSTD;
 pub use sync::{AtomicSlabBitmap, Mutex, Spinlock};
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), not(test), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {

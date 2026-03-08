@@ -10,16 +10,10 @@ build:
 	cargo build --release --target $(TARGET)
 
 run: build
-	@echo "Creating boot image..."
-	objcopy -O binary $(KERNEL) $(KERNEL).bin
 	@echo "Booting QEMU (press Ctrl+A, then X to quit)..."
-	qemu-system-x86_64 \
-		-machine pc \
-		-kernel $(KERNEL).bin \
-		-m 128M \
-		-display none \
-		-serial stdio \
-		-no-reboot
+	@echo "Tip: Run 'tail -f serial.log' in another terminal to see kernel output"
+	@rm -f serial.log
+	./boot_qemu.sh 
 
 clean:
 	cargo clean

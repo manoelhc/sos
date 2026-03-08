@@ -257,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(static_mut_refs)]
     fn test_alignment() {
         const ALIGNMENT: usize = 4096;
         static mut HEAP: [u8; BuddyAllocator::HEAP_SIZE + ALIGNMENT] =

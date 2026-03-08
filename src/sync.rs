@@ -8,49 +8,70 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub struct Spinlock {
     locked: AtomicBool,
+    irq_flags: AtomicUsize,
 }
 
 impl Spinlock {
     pub const fn new() -> Self {
         Spinlock {
             locked: AtomicBool::new(false),
+            irq_flags: AtomicUsize::new(0),
         }
     }
 
     #[inline]
     fn disable_interrupts() -> usize {
-        let flags: usize;
-        unsafe {
-            core::arch::asm!("pushf; pop {}", out(reg) flags, options(nostack));
+        #[cfg(test)]
+        {
+            return 0x200;
         }
-        flags & 0x200
+
+        #[cfg(not(test))]
+        {
+            let flags: usize;
+            unsafe {
+                core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
+            }
+            flags & 0x200
+        }
     }
 
     #[inline]
-    fn enable_interrupts(flags: usize) {
-        if flags & 0x200 != 0 {
-            unsafe {
-                core::arch::asm!("sti", options(nostack));
+    fn restore_interrupts(flags: usize) {
+        #[cfg(test)]
+        {
+            let _ = flags;
+            return;
+        }
+
+        #[cfg(not(test))]
+        {
+            if flags & 0x200 != 0 {
+                unsafe {
+                    core::arch::asm!("sti", options(nostack));
+                }
             }
         }
     }
 
     pub fn lock(&self) {
-        let saved_flags = Self::disable_interrupts();
+        let mut saved_flags = Self::disable_interrupts();
         while self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            Self::enable_interrupts(saved_flags);
+            Self::restore_interrupts(saved_flags);
             core::hint::spin_loop();
-            let saved_flags = Self::disable_interrupts();
+            saved_flags = Self::disable_interrupts();
         }
+        self.irq_flags.store(saved_flags, Ordering::Release);
     }
 
     pub fn unlock(&self) {
+        let saved_flags = self.irq_flags.swap(0, Ordering::AcqRel);
         self.locked.store(false, Ordering::Release);
-        Self::enable_interrupts(0);
+        Self::restore_interrupts(saved_flags);
     }
 
     pub fn is_locked(&self) -> bool {
@@ -146,12 +167,7 @@ impl AtomicSlabBitmap {
 
     pub fn find_free(&self) -> Option<usize> {
         let bits = self.bitmap.load(Ordering::Acquire);
-        for i in 0..self.max_bits {
-            if bits & (1usize << i) == 0 {
-                return Some(i);
-            }
-        }
-        None
+        (0..self.max_bits).find(|&i| bits & (1usize << i) == 0)
     }
 }
 

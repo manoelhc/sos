@@ -15,7 +15,8 @@ echo "Booting QEMU..."
 qemu-system-x86_64 \
     -kernel "$KERNEL" \
     -m 128M \
-    -nographic \
+    -display none \
+    -vnc :0 \
     -no-reboot \
-    -d int \
+    -serial file:serial.log \
     "$@"

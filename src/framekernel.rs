@@ -39,6 +39,9 @@ pub mod ostd {
     impl OSTD {
         pub const HEAP_SIZE: usize = BuddyAllocator::HEAP_SIZE;
 
+        /// # Safety
+        /// The caller must ensure `heap_start` and `heap_size` are valid and
+        /// the heap region does not overlap with other allocated memory.
         pub unsafe fn new(heap_start: usize, heap_size: usize) -> OSTD {
             OSTD {
                 _heap_start: heap_start,
@@ -46,10 +49,14 @@ pub mod ostd {
             }
         }
 
+        /// # Safety
+        /// The `layout` must be valid and properly aligned.
         pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             get_allocator().alloc(layout)
         }
 
+        /// # Safety
+        /// The `ptr` must have been allocated by this allocator with the same `layout`.
         pub unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
             get_allocator().dealloc(ptr, layout);
         }
