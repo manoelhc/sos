@@ -42,6 +42,7 @@ impl SlabAllocator {
             return core::ptr::null_mut();
         }
 
+        // Linear probe over fixed-size slots; each successful CAS reserves one slot.
         for i in 0..self.num_objects {
             if self.bitmap.try_set_bit(i) {
                 let offset = i * self.object_size;
@@ -67,6 +68,7 @@ impl SlabAllocator {
         }
 
         let offset = addr - self.memory_start;
+        // Integer division maps pointer back to object slot index.
         let index = offset / self.object_size;
 
         if index >= self.num_objects {

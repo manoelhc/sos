@@ -30,6 +30,7 @@ impl FreeList {
     }
 
     fn push(&mut self, addr: usize) {
+        // Intrusive list: first word of free block stores the next pointer.
         let next_ptr = addr as *mut usize;
         unsafe { next_ptr.write(self.head) };
         self.head = addr;
@@ -86,20 +87,42 @@ impl BuddyAllocator {
     pub unsafe fn new(base_addr: usize, size: usize) -> &'static mut BuddyAllocator {
         let max_order = (size.next_power_of_two().trailing_zeros() as usize).min(MAX_ORDERS - 1);
 
-        static mut ALLOCATOR: BuddyAllocator = BuddyAllocator {
-            base: 0,
-            total_size: 0,
-            max_order: 0,
-            free_lists: [const { UnsafeCell::new(FreeList::new()) }; MAX_ORDERS],
-        };
+        #[cfg(test)]
+        {
+            let mut allocator = Box::new(BuddyAllocator {
+                base: base_addr,
+                total_size: size,
+                max_order,
+                free_lists: [const { UnsafeCell::new(FreeList::new()) }; MAX_ORDERS],
+            });
+            for order in 0..MAX_ORDERS {
+                allocator.free_lists[order].get_mut().head = 0;
+            }
+            allocator.free_lists[max_order].get_mut().head = base_addr;
+            return Box::leak(allocator);
+        }
 
-        ALLOCATOR.base = base_addr;
-        ALLOCATOR.total_size = size;
-        ALLOCATOR.max_order = max_order;
-        ALLOCATOR.free_lists[max_order].get_mut().head = base_addr;
+        #[cfg(not(test))]
+        {
+            static mut ALLOCATOR: BuddyAllocator = BuddyAllocator {
+                base: 0,
+                total_size: 0,
+                max_order: 0,
+                free_lists: [const { UnsafeCell::new(FreeList::new()) }; MAX_ORDERS],
+            };
 
-        #[allow(static_mut_refs)]
-        &mut ALLOCATOR
+            ALLOCATOR.base = base_addr;
+            ALLOCATOR.total_size = size;
+            ALLOCATOR.max_order = max_order;
+            for order in 0..MAX_ORDERS {
+                ALLOCATOR.free_lists[order].get_mut().head = 0;
+            }
+            // Start with one maximal free block covering the whole managed region.
+            ALLOCATOR.free_lists[max_order].get_mut().head = base_addr;
+
+            #[allow(static_mut_refs)]
+            return &mut ALLOCATOR;
+        }
     }
 
     fn order_to_size(order: usize) -> usize {
@@ -112,6 +135,7 @@ impl BuddyAllocator {
     }
 
     fn buddy_of(addr: usize, order: usize) -> usize {
+        // Buddy addresses differ exactly by one bit at `order` position.
         addr ^ (1 << order)
     }
 
@@ -132,6 +156,7 @@ impl BuddyAllocator {
             if !(*free_list).is_empty() {
                 let block_addr = (*free_list).pop();
 
+                // Split larger blocks until we reach the exact requested order.
                 while order > required_order {
                     order -= 1;
                     let buddy = block_addr + Self::order_to_size(order);
@@ -164,6 +189,7 @@ impl BuddyAllocator {
 
         self.free_lists[order].get_mut().push(addr);
 
+        // Repeatedly merge with free buddy blocks to reduce fragmentation.
         while order < self.max_order {
             let buddy = Self::buddy_of(addr, order);
 

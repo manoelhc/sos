@@ -8,24 +8,30 @@ pub mod ostd {
     use core::alloc::{GlobalAlloc, Layout};
     use core::sync::atomic::{AtomicPtr, Ordering};
 
-    static HEAP: [u8; BuddyAllocator::HEAP_SIZE] = [0u8; BuddyAllocator::HEAP_SIZE];
+    static mut HEAP: [u8; BuddyAllocator::HEAP_SIZE] = [0u8; BuddyAllocator::HEAP_SIZE];
     static ALLOCATOR: AtomicPtr<BuddyAllocator> = AtomicPtr::new(core::ptr::null_mut());
 
     fn get_allocator() -> &'static mut BuddyAllocator {
+        // Fast path: allocator already initialized.
         let ptr = ALLOCATOR.load(Ordering::Acquire);
         if ptr.is_null() {
-            let new_alloc =
-                unsafe { BuddyAllocator::new(HEAP.as_ptr() as usize, BuddyAllocator::HEAP_SIZE) };
-            let new_ptr = new_alloc;
-            let exchange = ALLOCATOR
-                .compare_exchange(
-                    core::ptr::null_mut(),
-                    new_ptr,
-                    Ordering::Release,
-                    Ordering::Acquire,
+            // Slow path: initialize once with CAS so concurrent callers race safely.
+            let new_alloc = unsafe {
+                BuddyAllocator::new(
+                    core::ptr::addr_of_mut!(HEAP) as *mut u8 as usize,
+                    BuddyAllocator::HEAP_SIZE,
                 )
-                .unwrap_or(new_ptr);
-            unsafe { &mut *exchange }
+            };
+            let new_ptr = new_alloc;
+            match ALLOCATOR.compare_exchange(
+                core::ptr::null_mut(),
+                new_ptr,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => &mut *new_ptr,
+                Err(existing) => unsafe { &mut *existing },
+            }
         } else {
             unsafe { &mut *ptr }
         }
@@ -43,6 +49,7 @@ pub mod ostd {
         /// The caller must ensure `heap_start` and `heap_size` are valid and
         /// the heap region does not overlap with other allocated memory.
         pub unsafe fn new(heap_start: usize, heap_size: usize) -> OSTD {
+            // This stores metadata only; allocator backing memory is managed by `get_allocator`.
             OSTD {
                 _heap_start: heap_start,
                 _heap_size: heap_size,
@@ -62,13 +69,20 @@ pub mod ostd {
         }
     }
 
+    #[cfg(all(not(test), target_os = "none"))]
+    #[global_allocator]
+    static GLOBAL_ALLOCATOR: OSTD = OSTD {
+        _heap_start: 0,
+        _heap_size: 0,
+    };
+
     unsafe impl GlobalAlloc for OSTD {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            self.alloc(layout)
+            get_allocator().alloc(layout)
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            self.dealloc(ptr, layout)
+            get_allocator().dealloc(ptr, layout);
         }
     }
 

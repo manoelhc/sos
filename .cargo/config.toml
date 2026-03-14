@@ -1,2 +1,8 @@
 [target.x86_64-unknown-none]
 rustflags = ["-C", "link-arg=-Tsrc/bin/linker.ld", "-C", "link-arg=-no-pie"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

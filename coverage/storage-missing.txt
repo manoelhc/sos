@@ -1,0 +1,1149 @@
+    1|       |//! Storage engine primitives for Phase 3.
+    2|       |//!
+    3|       |//! This module provides:
+    4|       |//! - append-only Write-Ahead Log (WAL) with in-memory block-device persistence,
+    5|       |//! - crash recovery via deterministic WAL replay,
+    6|       |//! - copy-on-write object map updates with atomic publication,
+    7|       |//! - a compact fixed-fanout B-Tree with copy-on-write root publication.
+    8|       |
+    9|       |use crate::sync::Mutex;
+   10|       |use core::cmp::Ordering as CmpOrdering;
+   11|       |use core::sync::atomic::{AtomicUsize, Ordering};
+   12|       |
+   13|       |const WAL_MAGIC: u32 = 0x534F_5357;
+   14|       |const WAL_VERSION: u16 = 1;
+   15|       |const WAL_RECORD_ENCODED_SIZE: usize = 64;
+   16|       |pub const WAL_BLOCK_SIZE: usize = WAL_RECORD_ENCODED_SIZE;
+   17|       |
+   18|       |#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+   19|       |pub enum WalOp {
+   20|       |    Put,
+   21|       |    Delete,
+   22|       |}
+   23|       |
+   24|       |#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+   25|       |pub struct WalRecord {
+   26|       |    pub tx_id: u64,
+   27|       |    pub op: WalOp,
+   28|       |    pub key_hash: [u8; 32],
+   29|       |    pub lba: u64,
+   30|       |    pub len: u32,
+   31|       |    pub committed: bool,
+   32|       |}
+   33|       |
+   34|       |impl WalRecord {
+   35|  2.21k|    pub fn put(tx_id: u64, key_hash: [u8; 32], lba: u64, len: u32) -> Self {
+   36|  2.21k|        Self {
+   37|  2.21k|            tx_id,
+   38|  2.21k|            op: WalOp::Put,
+   39|  2.21k|            key_hash,
+   40|  2.21k|            lba,
+   41|  2.21k|            len,
+   42|  2.21k|            committed: false,
+   43|  2.21k|        }
+   44|  2.21k|    }
+   45|       |
+   46|     68|    pub fn delete(tx_id: u64, key_hash: [u8; 32]) -> Self {
+   47|     68|        Self {
+   48|     68|            tx_id,
+   49|     68|            op: WalOp::Delete,
+   50|     68|            key_hash,
+   51|     68|            lba: 0,
+   52|     68|            len: 0,
+   53|     68|            committed: false,
+   54|     68|        }
+   55|     68|    }
+   56|       |
+   57|  4.56k|    fn encode(&self) -> [u8; WAL_RECORD_ENCODED_SIZE] {
+   58|  4.56k|        let mut out = [0u8; WAL_RECORD_ENCODED_SIZE];
+   59|  4.56k|        out[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+   60|  4.56k|        out[4..6].copy_from_slice(&WAL_VERSION.to_le_bytes());
+   61|  4.56k|        out[6] = match self.op {
+   62|  4.42k|            WalOp::Put => 1,
+   63|    133|            WalOp::Delete => 2,
+   64|       |        };
+   65|  4.56k|        out[7] = u8::from(self.committed);
+   66|  4.56k|        out[8..16].copy_from_slice(&self.tx_id.to_le_bytes());
+   67|  4.56k|        out[16..48].copy_from_slice(&self.key_hash);
+   68|  4.56k|        out[48..56].copy_from_slice(&self.lba.to_le_bytes());
+   69|  4.56k|        out[56..60].copy_from_slice(&self.len.to_le_bytes());
+   70|  4.56k|        let checksum = checksum32(&out[..60]);
+   71|  4.56k|        out[60..64].copy_from_slice(&checksum.to_le_bytes());
+   72|  4.56k|        out
+   73|  4.56k|    }
+   74|       |
+   75|  8.49k|    fn decode(buf: &[u8; WAL_RECORD_ENCODED_SIZE]) -> Option<Self> {
+   76|  8.49k|        let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+   77|  8.49k|        if magic != WAL_MAGIC {
+   78|  2.08k|            return None;
+   79|  6.41k|        }
+   80|  6.41k|        let version = u16::from_le_bytes([buf[4], buf[5]]);
+   81|  6.41k|        if version != WAL_VERSION {
+   82|      1|            return None;
+   83|  6.41k|        }
+   84|       |
+   85|  6.41k|        let expected = u32::from_le_bytes([buf[60], buf[61], buf[62], buf[63]]);
+   86|  6.41k|        if checksum32(&buf[..60]) != expected {
+   87|      1|            return None;
+   88|  6.41k|        }
+   89|       |
+   90|  6.41k|        let op = match buf[6] {
+                          ^6.41k
+   91|  6.21k|            1 => WalOp::Put,
+   92|    195|            2 => WalOp::Delete,
+   93|      1|            _ => return None,
+   94|       |        };
+   95|  6.41k|        let committed = buf[7] != 0;
+   96|  6.41k|        let tx_id = u64::from_le_bytes([
+   97|  6.41k|            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+   98|  6.41k|        ]);
+   99|  6.41k|        let mut key_hash = [0u8; 32];
+  100|  6.41k|        key_hash.copy_from_slice(&buf[16..48]);
+  101|  6.41k|        let lba = u64::from_le_bytes([
+  102|  6.41k|            buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55],
+  103|  6.41k|        ]);
+  104|  6.41k|        let len = u32::from_le_bytes([buf[56], buf[57], buf[58], buf[59]]);
+  105|       |
+  106|  6.41k|        Some(Self {
+  107|  6.41k|            tx_id,
+  108|  6.41k|            op,
+  109|  6.41k|            key_hash,
+  110|  6.41k|            lba,
+  111|  6.41k|            len,
+  112|  6.41k|            committed,
+  113|  6.41k|        })
+  114|  8.49k|    }
+  115|       |}
+  116|       |
+  117|  10.9k|fn checksum32(data: &[u8]) -> u32 {
+  118|  10.9k|    let mut s = 0u32;
+  119|   658k|    for b in data {
+                           ^10.9k
+  120|   658k|        s = s.wrapping_add(*b as u32);
+  121|   658k|        s = s.rotate_left(3);
+  122|   658k|    }
+  123|  10.9k|    s
+  124|  10.9k|}
+  125|       |
+  126|       |pub trait WalBlockDevice {
+  127|       |    fn capacity_blocks(&self) -> usize;
+  128|       |    fn read_block(&self, index: usize, out: &mut [u8; WAL_BLOCK_SIZE]) -> bool;
+  129|       |    fn write_block(&self, index: usize, data: &[u8; WAL_BLOCK_SIZE]) -> bool;
+  130|       |}
+  131|       |
+  132|       |pub struct InMemoryWalDevice<const BLOCKS: usize> {
+  133|       |    blocks: Mutex<[[u8; WAL_BLOCK_SIZE]; BLOCKS]>,
+  134|       |}
+  135|       |
+  136|       |impl<const BLOCKS: usize> InMemoryWalDevice<BLOCKS> {
+  137|     12|    pub const fn new() -> Self {
+  138|     12|        Self {
+  139|     12|            blocks: Mutex::new([[0u8; WAL_BLOCK_SIZE]; BLOCKS]),
+  140|     12|        }
+  141|     12|    }
+  142|       |
+  143|       |    #[cfg(test)]
+  144|      1|    pub fn corrupt_byte(&self, block: usize, byte: usize, value: u8) {
+  145|      1|        let mut b = self.blocks.lock();
+  146|      1|        if block < BLOCKS && byte < WAL_BLOCK_SIZE {
+  147|      1|            b[block][byte] = value;
+  148|      1|        }
+                      ^0
+  149|      1|    }
+  150|       |}
+  151|       |
+  152|       |impl<const BLOCKS: usize> Default for InMemoryWalDevice<BLOCKS> {
+  153|      1|    fn default() -> Self {
+  154|      1|        Self::new()
+  155|      1|    }
+  156|       |}
+  157|       |
+  158|       |impl<const BLOCKS: usize> WalBlockDevice for InMemoryWalDevice<BLOCKS> {
+  159|  4.56k|    fn capacity_blocks(&self) -> usize {
+  160|  4.56k|        BLOCKS
+  161|  4.56k|    }
+  162|       |
+  163|  8.48k|    fn read_block(&self, index: usize, out: &mut [u8; WAL_BLOCK_SIZE]) -> bool {
+  164|  8.48k|        if index >= BLOCKS {
+  165|      1|            return false;
+  166|  8.48k|        }
+  167|  8.48k|        let b = self.blocks.lock();
+  168|  8.48k|        out.copy_from_slice(&b[index]);
+  169|  8.48k|        true
+  170|  8.48k|    }
+  171|       |
+  172|  4.55k|    fn write_block(&self, index: usize, data: &[u8; WAL_BLOCK_SIZE]) -> bool {
+  173|  4.55k|        if index >= BLOCKS {
+  174|      1|            return false;
+  175|  4.55k|        }
+  176|  4.55k|        let mut b = self.blocks.lock();
+  177|  4.55k|        b[index] = *data;
+  178|  4.55k|        true
+  179|  4.55k|    }
+  180|       |}
+  181|       |
+  182|       |pub struct WriteAheadLog<'a, D: WalBlockDevice> {
+  183|       |    device: &'a D,
+  184|       |    head: AtomicUsize,
+  185|       |}
+  186|       |
+  187|       |impl<'a, D: WalBlockDevice> WriteAheadLog<'a, D> {
+  188|     18|    pub fn new(device: &'a D) -> Self {
+  189|     18|        Self {
+  190|     18|            device,
+  191|     18|            head: AtomicUsize::new(0),
+  192|     18|        }
+  193|     18|    }
+  194|       |
+  195|  2.28k|    pub fn append(&self, rec: WalRecord) -> Option<usize> {
+  196|  2.28k|        let idx = self.head.fetch_add(1, Ordering::AcqRel);
+  197|  2.28k|        if idx >= self.device.capacity_blocks() {
+  198|      3|            return None;
+  199|  2.28k|        }
+  200|  2.28k|        let enc = rec.encode();
+  201|  2.28k|        if !self.device.write_block(idx, &enc) {
+  202|      1|            return None;
+  203|  2.28k|        }
+  204|  2.28k|        Some(idx)
+  205|  2.28k|    }
+  206|       |
+  207|  2.28k|    pub fn commit(&self, slot: usize) -> bool {
+  208|  2.28k|        if slot >= self.device.capacity_blocks() {
+  209|      1|            return false;
+  210|  2.27k|        }
+  211|  2.27k|        let mut raw = [0u8; WAL_BLOCK_SIZE];
+  212|  2.27k|        if !self.device.read_block(slot, &mut raw) {
+  213|      3|            return false;
+  214|  2.27k|        }
+  215|  2.27k|        let mut rec = match WalRecord::decode(&raw) {
+                          ^2.27k
+  216|  2.27k|            Some(r) => r,
+  217|      1|            None => return false,
+  218|       |        };
+  219|  2.27k|        rec.committed = true;
+  220|  2.27k|        self.device.write_block(slot, &rec.encode())
+  221|  2.28k|    }
+  222|       |
+  223|      6|    pub fn replay_committed<F: FnMut(WalRecord)>(&self, mut apply: F) {
+  224|  4.14k|        for idx in 0..self.device.capacity_blocks() {
+                                 ^6
+  225|  4.14k|            let mut raw = [0u8; WAL_BLOCK_SIZE];
+  226|  4.14k|            if !self.device.read_block(idx, &mut raw) {
+  227|      1|                continue;
+  228|  4.14k|            }
+  229|  4.14k|            if let Some(rec) = WalRecord::decode(&raw) {
+                                      ^2.06k
+  230|  2.06k|                if rec.committed {
+  231|  2.06k|                    apply(rec);
+  232|  2.06k|                }
+                              ^0
+  233|  2.07k|            }
+  234|       |        }
+  235|      6|    }
+  236|       |
+  237|      4|    pub fn recover_head(&self) -> usize {
+  238|      4|        let mut end = 0usize;
+  239|  2.07k|        for idx in 0..self.device.capacity_blocks() {
+                                 ^4
+  240|  2.07k|            let mut raw = [0u8; WAL_BLOCK_SIZE];
+  241|  2.07k|            if !self.device.read_block(idx, &mut raw) {
+  242|      1|                break;
+  243|  2.06k|            }
+  244|  2.06k|            if WalRecord::decode(&raw).is_some() {
+  245|  2.06k|                end = idx + 1;
+  246|  2.06k|            } else {
+  247|      3|                break;
+  248|       |            }
+  249|       |        }
+  250|      4|        self.head.store(end, Ordering::Release);
+  251|      4|        end
+  252|      4|    }
+  253|       |}
+  254|       |
+  255|       |#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  256|       |pub struct ObjectEntry {
+  257|       |    pub key_hash: [u8; 32],
+  258|       |    pub lba: u64,
+  259|       |    pub len: u32,
+  260|       |}
+  261|       |
+  262|       |#[derive(Clone, Copy)]
+  263|       |struct ObjectMap<const N: usize> {
+  264|       |    entries: [Option<ObjectEntry>; N],
+  265|       |}
+  266|       |
+  267|       |impl<const N: usize> ObjectMap<N> {
+  268|     30|    const fn new() -> Self {
+  269|     30|        Self { entries: [None; N] }
+  270|     30|    }
+  271|       |
+  272|    262|    fn get(&self, key_hash: &[u8; 32]) -> Option<ObjectEntry> {
+  273|    262|        self.entries
+  274|    262|            .iter()
+  275|    262|            .flatten()
+  276|  12.3k|            .find(|e| &e.key_hash == key_hash)
+                           ^262
+  277|    262|            .copied()
+  278|    262|    }
+  279|       |
+  280|  4.21k|    fn upsert(&mut self, entry: ObjectEntry) -> bool {
+  281|   308k|        for slot in &mut self.entries {
+                                  ^4.21k
+  282|   308k|            if let Some(existing) = slot {
+                                      ^257k
+  283|   257k|                if existing.key_hash == entry.key_hash {
+  284|  3.91k|                    *slot = Some(entry);
+  285|  3.91k|                    return true;
+  286|   253k|                }
+  287|  50.9k|            }
+  288|       |        }
+  289|  17.0k|        for slot in &mut self.entries {
+                                  ^299
+  290|  17.0k|            if slot.is_none() {
+  291|    297|                *slot = Some(entry);
+  292|    297|                return true;
+  293|  16.7k|            }
+  294|       |        }
+  295|      2|        false
+  296|  4.21k|    }
+  297|       |
+  298|    131|    fn delete(&mut self, key_hash: &[u8; 32]) -> bool {
+  299|  4.16k|        for slot in &mut self.entries {
+                                  ^131
+  300|  4.16k|            if let Some(existing) = slot {
+                                      ^131
+  301|    131|                if &existing.key_hash == key_hash {
+  302|    130|                    *slot = None;
+  303|    130|                    return true;
+  304|      1|                }
+  305|  4.03k|            }
+  306|       |        }
+  307|      1|        false
+  308|    131|    }
+  309|       |}
+  310|       |
+  311|       |pub struct CowObjectIndex<const N: usize> {
+  312|       |    maps: [Mutex<ObjectMap<N>>; 2],
+  313|       |    active: AtomicUsize,
+  314|       |}
+  315|       |
+  316|       |impl<const N: usize> CowObjectIndex<N> {
+  317|     15|    pub fn new() -> Self {
+  318|     15|        Self {
+  319|     15|            maps: [Mutex::new(ObjectMap::new()), Mutex::new(ObjectMap::new())],
+  320|     15|            active: AtomicUsize::new(0),
+  321|     15|        }
+  322|     15|    }
+  323|       |
+  324|    262|    pub fn get(&self, key_hash: &[u8; 32]) -> Option<ObjectEntry> {
+  325|    262|        let idx = self.active.load(Ordering::Acquire) & 1;
+  326|    262|        let map = self.maps[idx].lock();
+  327|    262|        map.get(key_hash)
+  328|    262|    }
+  329|       |
+  330|  4.21k|    pub fn upsert(&self, entry: ObjectEntry) -> bool {
+  331|  4.21k|        self.swap_with(|m| m.upsert(entry))
+  332|  4.21k|    }
+  333|       |
+  334|    131|    pub fn delete(&self, key_hash: &[u8; 32]) -> bool {
+  335|    131|        self.swap_with(|m| m.delete(key_hash))
+  336|    131|    }
+  337|       |
+  338|  4.34k|    fn swap_with<F: FnOnce(&mut ObjectMap<N>) -> bool>(&self, f: F) -> bool {
+  339|  4.34k|        let current = self.active.load(Ordering::Acquire) & 1;
+  340|  4.34k|        let next = 1 - current;
+  341|       |
+  342|  4.34k|        let src = self.maps[current].lock();
+  343|  4.34k|        let mut dst = self.maps[next].lock();
+  344|  4.34k|        *dst = *src;
+  345|  4.34k|        let changed = f(&mut dst);
+  346|  4.34k|        let _ = self
+  347|  4.34k|            .active
+  348|  4.34k|            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire);
+  349|  4.34k|        changed
+  350|  4.34k|    }
+  351|       |
+  352|  4.33k|    pub fn apply_wal(&self, rec: WalRecord) -> bool {
+  353|  4.33k|        match rec.op {
+  354|  4.20k|            WalOp::Put => self.upsert(ObjectEntry {
+  355|  4.20k|                key_hash: rec.key_hash,
+  356|  4.20k|                lba: rec.lba,
+  357|  4.20k|                len: rec.len,
+  358|  4.20k|            }),
+  359|    129|            WalOp::Delete => self.delete(&rec.key_hash),
+  360|       |        }
+  361|  4.33k|    }
+  362|       |}
+  363|       |
+  364|       |impl<const N: usize> Default for CowObjectIndex<N> {
+  365|      1|    fn default() -> Self {
+  366|      1|        Self::new()
+  367|      1|    }
+  368|       |}
+  369|       |
+  370|       |#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  371|       |pub struct BTreeNodeEntry {
+  372|       |    pub key_hash: [u8; 32],
+  373|       |    pub lba: u64,
+  374|       |}
+  375|       |
+  376|       |#[derive(Clone, Copy)]
+  377|       |pub struct BTreeNode<const FANOUT: usize> {
+  378|       |    entries: [Option<BTreeNodeEntry>; FANOUT],
+  379|       |    len: usize,
+  380|       |}
+  381|       |
+  382|       |impl<const FANOUT: usize> BTreeNode<FANOUT> {
+  383|     30|    pub const fn new() -> Self {
+  384|     30|        Self {
+  385|     30|            entries: [None; FANOUT],
+  386|     30|            len: 0,
+  387|     30|        }
+  388|     30|    }
+  389|       |
+  390|  4.21k|    pub fn insert_sorted(&mut self, entry: BTreeNodeEntry) -> bool {
+  391|  4.21k|        if self.len >= FANOUT {
+  392|      2|            return false;
+  393|  4.21k|        }
+  394|       |
+  395|  4.21k|        let mut pos = self.len;
+  396|   257k|        for i in 0..self.len {
+                               ^4.21k
+  397|   257k|            let cur = self.entries[i].expect("occupied before len");
+  398|   257k|            if key_cmp(&entry.key_hash, &cur.key_hash).is_lt() {
+  399|      2|                pos = i;
+  400|      2|                break;
+  401|   257k|            }
+  402|   257k|            if cur.key_hash == entry.key_hash {
+  403|  3.91k|                self.entries[i] = Some(entry);
+  404|  3.91k|                return true;
+  405|   253k|            }
+  406|       |        }
+  407|       |
+  408|    298|        for i in (pos..self.len).rev() {
+                          ^2
+  409|      2|            self.entries[i + 1] = self.entries[i];
+  410|      2|        }
+  411|    298|        self.entries[pos] = Some(entry);
+  412|    298|        self.len += 1;
+  413|    298|        true
+  414|  4.21k|    }
+  415|       |
+  416|    132|    pub fn delete(&mut self, key_hash: &[u8; 32]) -> bool {
+  417|    132|        let mut pos = None;
+  418|    132|        for i in 0..self.len {
+  419|    132|            if let Some(entry) = self.entries[i] {
+                                      ^131
+  420|    131|                if &entry.key_hash == key_hash {
+  421|    130|                    pos = Some(i);
+  422|    130|                    break;
+  423|      1|                }
+  424|      1|            }
+  425|       |        }
+  426|    132|        let i = match pos {
+                          ^130
+  427|    130|            Some(v) => v,
+  428|      2|            None => return false,
+  429|       |        };
+  430|  12.2k|        for j in i..(self.len - 1) {
+                               ^130
+  431|  12.2k|            self.entries[j] = self.entries[j + 1];
+  432|  12.2k|        }
+  433|    130|        self.entries[self.len - 1] = None;
+  434|    130|        self.len -= 1;
+  435|    130|        true
+  436|    132|    }
+  437|       |
+  438|      8|    pub fn find(&self, key_hash: &[u8; 32]) -> Option<BTreeNodeEntry> {
+  439|      8|        self.entries[..self.len]
+  440|      8|            .iter()
+  441|      8|            .flatten()
+  442|      9|            .find(|e| &e.key_hash == key_hash)
+                           ^8
+  443|      8|            .copied()
+  444|      8|    }
+  445|       |
+  446|      1|    pub fn entries(&self) -> &[Option<BTreeNodeEntry>] {
+  447|      1|        &self.entries[..self.len]
+  448|      1|    }
+  449|       |
+  450|       |    #[cfg(test)]
+  451|      1|    fn force_hole_for_test(&mut self) {
+  452|      1|        if FANOUT == 0 {
+  453|      0|            return;
+  454|      1|        }
+  455|      1|        self.len = 1;
+  456|      1|        self.entries[0] = None;
+  457|      1|    }
+  458|       |}
+  459|       |
+  460|       |impl<const FANOUT: usize> Default for BTreeNode<FANOUT> {
+  461|      1|    fn default() -> Self {
+  462|      1|        Self::new()
+  463|      1|    }
+  464|       |}
+  465|       |
+  466|       |pub struct CowBTreeIndex<const FANOUT: usize> {
+  467|       |    roots: [Mutex<BTreeNode<FANOUT>>; 2],
+  468|       |    active: AtomicUsize,
+  469|       |}
+  470|       |
+  471|       |impl<const FANOUT: usize> CowBTreeIndex<FANOUT> {
+  472|     13|    pub fn new() -> Self {
+  473|     13|        Self {
+  474|     13|            roots: [Mutex::new(BTreeNode::new()), Mutex::new(BTreeNode::new())],
+  475|     13|            active: AtomicUsize::new(0),
+  476|     13|        }
+  477|     13|    }
+  478|       |
+  479|      5|    pub fn find(&self, key_hash: &[u8; 32]) -> Option<BTreeNodeEntry> {
+  480|      5|        let idx = self.active.load(Ordering::Acquire) & 1;
+  481|      5|        let root = self.roots[idx].lock();
+  482|      5|        root.find(key_hash)
+  483|      5|    }
+  484|       |
+  485|  4.20k|    pub fn upsert(&self, entry: BTreeNodeEntry) -> bool {
+  486|  4.20k|        self.swap_root(|root| root.insert_sorted(entry))
+  487|  4.20k|    }
+  488|       |
+  489|    130|    pub fn delete(&self, key_hash: &[u8; 32]) -> bool {
+  490|    130|        self.swap_root(|root| root.delete(key_hash))
+  491|    130|    }
+  492|       |
+  493|  4.33k|    fn swap_root<F: FnOnce(&mut BTreeNode<FANOUT>) -> bool>(&self, f: F) -> bool {
+  494|  4.33k|        let current = self.active.load(Ordering::Acquire) & 1;
+  495|  4.33k|        let next = 1 - current;
+  496|       |
+  497|  4.33k|        let src = self.roots[current].lock();
+  498|  4.33k|        let mut dst = self.roots[next].lock();
+  499|  4.33k|        *dst = *src;
+  500|  4.33k|        let changed = f(&mut dst);
+  501|  4.33k|        let _ = self
+  502|  4.33k|            .active
+  503|  4.33k|            .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire);
+  504|  4.33k|        changed
+  505|  4.33k|    }
+  506|       |}
+  507|       |
+  508|       |impl<const FANOUT: usize> Default for CowBTreeIndex<FANOUT> {
+  509|      1|    fn default() -> Self {
+  510|      1|        Self::new()
+  511|      1|    }
+  512|       |}
+  513|       |
+  514|       |#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  515|       |pub enum TxError {
+  516|       |    WalFull,
+  517|       |    CommitFailed,
+  518|       |    IndexUpdateFailed,
+  519|       |}
+  520|       |
+  521|       |#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  522|       |pub enum TxStatus {
+  523|       |    Idle,
+  524|       |    InFlight,
+  525|       |    Committed,
+  526|       |    Aborted,
+  527|       |}
+  528|       |
+  529|       |impl TxStatus {
+  530|    206|    fn from_usize(v: usize) -> Self {
+  531|    206|        match v {
+  532|      1|            1 => TxStatus::InFlight,
+  533|    203|            2 => TxStatus::Committed,
+  534|      1|            3 => TxStatus::Aborted,
+  535|      1|            _ => TxStatus::Idle,
+  536|       |        }
+  537|    206|    }
+  538|       |
+  539|  4.56k|    fn as_usize(self) -> usize {
+  540|  4.56k|        match self {
+  541|     11|            TxStatus::Idle => 0,
+  542|  2.27k|            TxStatus::InFlight => 1,
+  543|  2.27k|            TxStatus::Committed => 2,
+  544|      5|            TxStatus::Aborted => 3,
+  545|       |        }
+  546|  4.56k|    }
+  547|       |}
+  548|       |
+  549|       |pub struct AtomicTransactionManager<'a, D: WalBlockDevice, const N: usize, const FANOUT: usize> {
+  550|       |    wal: WriteAheadLog<'a, D>,
+  551|       |    object_index: CowObjectIndex<N>,
+  552|       |    btree_index: CowBTreeIndex<FANOUT>,
+  553|       |    tx_seq: AtomicUsize,
+  554|       |    epoch: AtomicUsize,
+  555|       |    status: AtomicUsize,
+  556|       |}
+  557|       |
+  558|       |impl<'a, D: WalBlockDevice, const N: usize, const FANOUT: usize>
+  559|       |    AtomicTransactionManager<'a, D, N, FANOUT>
+  560|       |{
+  561|     11|    pub fn new(device: &'a D) -> Self {
+  562|     11|        Self {
+  563|     11|            wal: WriteAheadLog::new(device),
+  564|     11|            object_index: CowObjectIndex::new(),
+  565|     11|            btree_index: CowBTreeIndex::new(),
+  566|     11|            tx_seq: AtomicUsize::new(1),
+  567|     11|            epoch: AtomicUsize::new(0),
+  568|     11|            status: AtomicUsize::new(TxStatus::Idle.as_usize()),
+  569|     11|        }
+  570|     11|    }
+  571|       |
+  572|    203|    pub fn status(&self) -> TxStatus {
+  573|    203|        TxStatus::from_usize(self.status.load(Ordering::Acquire))
+  574|    203|    }
+  575|       |
+  576|    202|    pub fn epoch(&self) -> usize {
+  577|    202|        self.epoch.load(Ordering::Acquire)
+  578|    202|    }
+  579|       |
+  580|  2.20k|    pub fn put(&self, key_hash: [u8; 32], lba: u64, len: u32) -> Result<usize, TxError> {
+  581|  2.20k|        self.status
+  582|  2.20k|            .store(TxStatus::InFlight.as_usize(), Ordering::Release);
+  583|       |
+  584|  2.20k|        let tx_id = self.tx_seq.fetch_add(1, Ordering::AcqRel) as u64;
+  585|  2.20k|        let rec = WalRecord::put(tx_id, key_hash, lba, len);
+  586|  2.20k|        let slot = self.wal.append(rec).ok_or(TxError::WalFull)?;
+                          ^2.20k                                             ^1
+  587|  2.20k|        if !self.wal.commit(slot) {
+  588|      1|            self.status
+  589|      1|                .store(TxStatus::Aborted.as_usize(), Ordering::Release);
+  590|      1|            return Err(TxError::CommitFailed);
+  591|  2.20k|        }
+  592|       |
+  593|  2.20k|        if !self.object_index.apply_wal(WalRecord {
+  594|  2.20k|            committed: true,
+  595|  2.20k|            ..rec
+  596|  2.20k|        }) {
+  597|      1|            self.status
+  598|      1|                .store(TxStatus::Aborted.as_usize(), Ordering::Release);
+  599|      1|            return Err(TxError::IndexUpdateFailed);
+  600|  2.20k|        }
+  601|       |
+  602|  2.20k|        let btree_ok = self.btree_index.upsert(BTreeNodeEntry { key_hash, lba });
+  603|  2.20k|        if !btree_ok {
+  604|      1|            self.status
+  605|      1|                .store(TxStatus::Aborted.as_usize(), Ordering::Release);
+  606|      1|            return Err(TxError::IndexUpdateFailed);
+  607|  2.20k|        }
+  608|       |
+  609|  2.20k|        self.bump_epoch_cas();
+  610|  2.20k|        self.status
+  611|  2.20k|            .store(TxStatus::Committed.as_usize(), Ordering::Release);
+  612|  2.20k|        Ok(slot)
+  613|  2.20k|    }
+  614|       |
+  615|     67|    pub fn delete(&self, key_hash: [u8; 32]) -> Result<usize, TxError> {
+  616|     67|        self.status
+  617|     67|            .store(TxStatus::InFlight.as_usize(), Ordering::Release);
+  618|       |
+  619|     67|        let tx_id = self.tx_seq.fetch_add(1, Ordering::AcqRel) as u64;
+  620|     67|        let rec = WalRecord::delete(tx_id, key_hash);
+  621|     67|        let slot = self.wal.append(rec).ok_or(TxError::WalFull)?;
+                          ^66                                                ^1
+  622|     66|        if !self.wal.commit(slot) {
+  623|      1|            self.status
+  624|      1|                .store(TxStatus::Aborted.as_usize(), Ordering::Release);
+  625|      1|            return Err(TxError::CommitFailed);
+  626|     65|        }
+  627|       |
+  628|     65|        let _ = self.object_index.apply_wal(WalRecord {
+  629|     65|            committed: true,
+  630|     65|            ..rec
+  631|     65|        });
+  632|     65|        let _ = self.btree_index.delete(&key_hash);
+  633|       |
+  634|     65|        self.bump_epoch_cas();
+  635|     65|        self.status
+  636|     65|            .store(TxStatus::Committed.as_usize(), Ordering::Release);
+  637|     65|        Ok(slot)
+  638|     67|    }
+  639|       |
+  640|      2|    pub fn recover(&self) {
+  641|      2|        let _ = self.wal.recover_head();
+  642|  2.06k|        self.wal.replay_committed(|rec| {
+                      ^2       ^2
+  643|  2.06k|            let _ = self.object_index.apply_wal(rec);
+  644|  2.06k|            match rec.op {
+  645|  2.00k|                WalOp::Put => {
+  646|  2.00k|                    let _ = self.btree_index.upsert(BTreeNodeEntry {
+  647|  2.00k|                        key_hash: rec.key_hash,
+  648|  2.00k|                        lba: rec.lba,
+  649|  2.00k|                    });
+  650|  2.00k|                }
+  651|     64|                WalOp::Delete => {
+  652|     64|                    let _ = self.btree_index.delete(&rec.key_hash);
+  653|     64|                }
+  654|       |            }
+  655|  2.06k|        });
+  656|      2|        self.status
+  657|      2|            .store(TxStatus::Committed.as_usize(), Ordering::Release);
+  658|      2|    }
+  659|       |
+  660|    259|    pub fn get_object(&self, key_hash: &[u8; 32]) -> Option<ObjectEntry> {
+  661|    259|        self.object_index.get(key_hash)
+  662|    259|    }
+  663|       |
+  664|      3|    pub fn btree_lookup(&self, key_hash: &[u8; 32]) -> Option<BTreeNodeEntry> {
+  665|      3|        self.btree_index.find(key_hash)
+  666|      3|    }
+  667|       |
+  668|  2.26k|    fn bump_epoch_cas(&self) {
+  669|  2.26k|        let mut cur = self.epoch.load(Ordering::Acquire).wrapping_sub(1);
+  670|       |        loop {
+  671|  4.53k|            let next = cur.wrapping_add(1);
+  672|  4.53k|            match self
+  673|  4.53k|                .epoch
+  674|  4.53k|                .compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire)
+  675|       |            {
+  676|  2.26k|                Ok(_) => break,
+  677|  2.26k|                Err(observed) => cur = observed,
+  678|       |            }
+  679|       |        }
+  680|  2.26k|    }
+  681|       |}
+  682|       |
+  683|   257k|fn key_cmp(a: &[u8; 32], b: &[u8; 32]) -> CmpOrdering {
+  684|   378k|    for i in 0..32 {
+                           ^257k
+  685|   378k|        if a[i] < b[i] {
+  686|      2|            return CmpOrdering::Less;
+  687|   378k|        }
+  688|   378k|        if a[i] > b[i] {
+  689|   253k|            return CmpOrdering::Greater;
+  690|   125k|        }
+  691|       |    }
+  692|  3.91k|    CmpOrdering::Equal
+  693|   257k|}
+  694|       |
+  695|       |#[cfg(test)]
+  696|       |mod tests {
+  697|       |    use super::*;
+  698|       |    use crate::crypto::{PathCrypto, NONCE_SIZE};
+  699|       |    use core::sync::atomic::AtomicU64;
+  700|       |
+  701|       |    struct FaultyWalDevice<const BLOCKS: usize> {
+  702|       |        fail_read_at: Option<usize>,
+  703|       |        fail_write_at: Option<usize>,
+  704|       |        blocks: Mutex<[[u8; WAL_BLOCK_SIZE]; BLOCKS]>,
+  705|       |    }
+  706|       |
+  707|       |    impl<const BLOCKS: usize> FaultyWalDevice<BLOCKS> {
+  708|      5|        const fn new(fail_read_at: Option<usize>, fail_write_at: Option<usize>) -> Self {
+  709|      5|            Self {
+  710|      5|                fail_read_at,
+  711|      5|                fail_write_at,
+  712|      5|                blocks: Mutex::new([[0u8; WAL_BLOCK_SIZE]; BLOCKS]),
+  713|      5|            }
+  714|      5|        }
+  715|       |
+  716|      1|        fn write_raw(&self, index: usize, raw: [u8; WAL_BLOCK_SIZE]) {
+  717|      1|            let mut blocks = self.blocks.lock();
+  718|      1|            if index < BLOCKS {
+  719|      1|                blocks[index] = raw;
+  720|      1|            }
+                          ^0
+  721|      1|        }
+  722|       |    }
+  723|       |
+  724|       |    impl<const BLOCKS: usize> WalBlockDevice for FaultyWalDevice<BLOCKS> {
+  725|     11|        fn capacity_blocks(&self) -> usize {
+  726|     11|            BLOCKS
+  727|     11|        }
+  728|       |
+  729|      7|        fn read_block(&self, index: usize, out: &mut [u8; WAL_BLOCK_SIZE]) -> bool {
+  730|      7|            if self.fail_read_at == Some(index) || index >= BLOCKS {
+                                                                 ^2
+  731|      5|                return false;
+  732|      2|            }
+  733|      2|            let blocks = self.blocks.lock();
+  734|      2|            out.copy_from_slice(&blocks[index]);
+  735|      2|            true
+  736|      7|        }
+  737|       |
+  738|      5|        fn write_block(&self, index: usize, data: &[u8; WAL_BLOCK_SIZE]) -> bool {
+  739|      5|            if self.fail_write_at == Some(index) || index >= BLOCKS {
+                                                                  ^4
+  740|      1|                return false;
+  741|      4|            }
+  742|      4|            let mut blocks = self.blocks.lock();
+  743|      4|            blocks[index] = *data;
+  744|      4|            true
+  745|      5|        }
+  746|       |    }
+  747|       |
+  748|  2.55k|    fn kh(v: u8) -> [u8; 32] {
+  749|  2.55k|        [v; 32]
+  750|  2.55k|    }
+  751|       |
+  752|       |    #[test]
+  753|      1|    fn test_wal_commit_and_replay() {
+  754|      1|        let dev: InMemoryWalDevice<8> = InMemoryWalDevice::new();
+  755|      1|        let wal = WriteAheadLog::new(&dev);
+  756|      1|        let slot1 = wal.append(WalRecord::put(1, kh(1), 100, 32)).unwrap();
+  757|      1|        let slot2 = wal.append(WalRecord::delete(2, kh(2))).unwrap();
+  758|      1|        assert!(wal.commit(slot1));
+  759|      1|        assert!(wal.commit(slot2));
+  760|       |
+  761|      1|        let mut replayed = 0usize;
+  762|      1|        wal.replay_committed(|_| replayed += 1);
+  763|      1|        assert_eq!(replayed, 2);
+  764|      1|    }
+  765|       |
+  766|       |    #[test]
+  767|      1|    fn test_wal_recovery_ignores_corrupted_tail() {
+  768|      1|        let dev: InMemoryWalDevice<8> = InMemoryWalDevice::new();
+  769|      1|        let wal = WriteAheadLog::new(&dev);
+  770|      1|        let s1 = wal.append(WalRecord::put(10, kh(5), 11, 3)).unwrap();
+  771|      1|        assert!(wal.commit(s1));
+  772|      1|        let _ = wal.append(WalRecord::put(11, kh(6), 22, 4)).unwrap();
+  773|       |
+  774|      1|        dev.corrupt_byte(1, 0, 0xEE);
+  775|       |
+  776|      1|        let recovered = wal.recover_head();
+  777|      1|        assert_eq!(recovered, 1);
+  778|       |
+  779|      1|        let mut replayed = 0;
+  780|      1|        wal.replay_committed(|r| {
+  781|      1|            replayed += 1;
+  782|      1|            assert_eq!(r.tx_id, 10);
+  783|      1|        });
+  784|      1|        assert_eq!(replayed, 1);
+  785|      1|    }
+  786|       |
+  787|       |    #[test]
+  788|      1|    fn test_cow_index_upsert_delete() {
+  789|      1|        let idx: CowObjectIndex<16> = CowObjectIndex::new();
+  790|      1|        let e = ObjectEntry {
+  791|      1|            key_hash: kh(7),
+  792|      1|            lba: 123,
+  793|      1|            len: 9,
+  794|      1|        };
+  795|      1|        assert!(idx.upsert(e));
+  796|      1|        assert_eq!(idx.get(&kh(7)), Some(e));
+  797|      1|        assert!(idx.delete(&kh(7)));
+  798|      1|        assert_eq!(idx.get(&kh(7)), None);
+  799|      1|    }
+  800|       |
+  801|       |    #[test]
+  802|      1|    fn test_btree_node_sorted_insert_and_find() {
+  803|      1|        let mut node: BTreeNode<4> = BTreeNode::new();
+  804|      1|        assert!(node.insert_sorted(BTreeNodeEntry {
+  805|      1|            key_hash: kh(3),
+  806|      1|            lba: 30,
+  807|      1|        }));
+  808|      1|        assert!(node.insert_sorted(BTreeNodeEntry {
+  809|      1|            key_hash: kh(1),
+  810|      1|            lba: 10,
+  811|      1|        }));
+  812|      1|        assert!(node.insert_sorted(BTreeNodeEntry {
+  813|      1|            key_hash: kh(2),
+  814|      1|            lba: 20,
+  815|      1|        }));
+  816|       |
+  817|      1|        assert_eq!(node.find(&kh(1)).unwrap().lba, 10);
+  818|      1|        assert_eq!(node.find(&kh(2)).unwrap().lba, 20);
+  819|      1|        assert_eq!(node.find(&kh(3)).unwrap().lba, 30);
+  820|      1|    }
+  821|       |
+  822|       |    #[test]
+  823|      1|    fn test_cow_btree_index_upsert_find_delete() {
+  824|      1|        let tree: CowBTreeIndex<8> = CowBTreeIndex::new();
+  825|      1|        let e = BTreeNodeEntry {
+  826|      1|            key_hash: kh(9),
+  827|      1|            lba: 900,
+  828|      1|        };
+  829|      1|        assert!(tree.upsert(e));
+  830|      1|        assert_eq!(tree.find(&kh(9)), Some(e));
+  831|      1|        assert!(tree.delete(&kh(9)));
+  832|      1|        assert_eq!(tree.find(&kh(9)), None);
+  833|      1|    }
+  834|       |
+  835|       |    #[test]
+  836|      1|    fn test_phase3_end_to_end_encrypt_wal_recover_index() {
+  837|      1|        let master = [1u8; 32];
+  838|      1|        let salt = [2u8; 32];
+  839|      1|        let path = "/objects/a.bin";
+  840|      1|        let nonce = [7u8; NONCE_SIZE];
+  841|      1|        let mut payload = *b"phase3-object";
+  842|       |
+  843|      1|        let key = PathCrypto::derive_object_key(&master, &salt, path);
+  844|      1|        let tag = PathCrypto::encrypt_in_place(&key, &nonce, path.as_bytes(), &mut payload);
+  845|       |
+  846|      1|        let dev: InMemoryWalDevice<16> = InMemoryWalDevice::new();
+  847|      1|        let wal = WriteAheadLog::new(&dev);
+  848|      1|        let idx: CowObjectIndex<16> = CowObjectIndex::new();
+  849|       |
+  850|      1|        let key_hash = PathCrypto::path_hash(path);
+  851|      1|        let rec = WalRecord::put(42, key_hash, 4096, payload.len() as u32);
+  852|      1|        let slot = wal.append(rec).unwrap();
+  853|      1|        assert!(wal.commit(slot));
+  854|       |
+  855|      1|        let mut replay_count = 0usize;
+  856|      1|        wal.replay_committed(|r| {
+  857|      1|            replay_count += 1;
+  858|      1|            assert!(idx.apply_wal(r));
+  859|      1|        });
+  860|      1|        assert_eq!(replay_count, 1);
+  861|       |
+  862|      1|        let stored = idx.get(&key_hash).unwrap();
+  863|      1|        assert_eq!(stored.lba, 4096);
+  864|      1|        assert_eq!(stored.len, payload.len() as u32);
+  865|       |
+  866|      1|        let mut decrypted = payload;
+  867|      1|        assert!(PathCrypto::decrypt_in_place(
+  868|      1|            &key,
+  869|      1|            &nonce,
+  870|      1|            path.as_bytes(),
+  871|      1|            &mut decrypted,
+  872|      1|            &tag
+  873|       |        ));
+  874|      1|        assert_eq!(&decrypted, b"phase3-object");
+  875|      1|    }
+  876|       |
+  877|       |    #[test]
+  878|      1|    fn test_phase4_atomic_transaction_put_delete() {
+  879|      1|        let dev: InMemoryWalDevice<32> = InMemoryWalDevice::new();
+  880|      1|        let txm: AtomicTransactionManager<'_, _, 32, 16> = AtomicTransactionManager::new(&dev);
+  881|       |
+  882|      1|        let key = PathCrypto::path_hash("/phase4/item");
+  883|      1|        let put = txm.put(key, 8192, 128);
+  884|      1|        assert!(put.is_ok());
+  885|      1|        assert_eq!(txm.status(), TxStatus::Committed);
+  886|      1|        assert!(txm.get_object(&key).is_some());
+  887|      1|        assert!(txm.btree_lookup(&key).is_some());
+  888|       |
+  889|      1|        let del = txm.delete(key);
+  890|      1|        assert!(del.is_ok());
+  891|      1|        assert_eq!(txm.status(), TxStatus::Committed);
+  892|      1|        assert!(txm.get_object(&key).is_none());
+  893|      1|        assert!(txm.btree_lookup(&key).is_none());
+  894|      1|    }
+  895|       |
+  896|       |    #[test]
+  897|      1|    fn test_phase4_recovery_rebuilds_indices() {
+  898|      1|        let dev: InMemoryWalDevice<16> = InMemoryWalDevice::new();
+  899|      1|        let txm: AtomicTransactionManager<'_, _, 16, 8> = AtomicTransactionManager::new(&dev);
+  900|      1|        let key = PathCrypto::path_hash("/phase4/recover");
+  901|       |
+  902|      1|        assert!(txm.put(key, 12288, 64).is_ok());
+  903|       |
+  904|      1|        let recovered: AtomicTransactionManager<'_, _, 16, 8> = AtomicTransactionManager::new(&dev);
+  905|      1|        recovered.recover();
+  906|      1|        assert!(recovered.get_object(&key).is_some());
+  907|      1|        assert!(recovered.btree_lookup(&key).is_some());
+  908|      1|    }
+  909|       |
+  910|       |    #[test]
+  911|      1|    fn test_phase4_acquire_release_visibility() {
+  912|      1|        let marker = AtomicU64::new(0);
+  913|      1|        let published_epoch = AtomicUsize::new(0);
+  914|       |
+  915|      1|        marker.store(0xA5A5_1234_5678_9ABC, Ordering::Relaxed);
+  916|      1|        published_epoch.store(1, Ordering::Release);
+  917|       |
+  918|      1|        let observed_epoch = published_epoch.load(Ordering::Acquire);
+  919|      1|        assert_eq!(observed_epoch, 1);
+  920|      1|        let observed_marker = marker.load(Ordering::Relaxed);
+  921|      1|        assert_eq!(observed_marker, 0xA5A5_1234_5678_9ABC);
+  922|      1|    }
+  923|       |
+  924|       |    #[test]
+  925|      1|    fn test_phase4_high_load_transaction_stress() {
+  926|       |        const UNIQUE_KEYS: usize = 128;
+  927|       |        const PUT_OPS: usize = 2_000;
+  928|       |        const DELETE_OPS: usize = UNIQUE_KEYS / 2;
+  929|       |
+  930|      1|        let dev: InMemoryWalDevice<4_096> = InMemoryWalDevice::new();
+  931|      1|        let txm: AtomicTransactionManager<'_, _, 256, 256> = AtomicTransactionManager::new(&dev);
+  932|       |
+  933|      1|        let mut expected = [false; UNIQUE_KEYS];
+  934|       |
+  935|  2.00k|        for i in 0..PUT_OPS {
+                               ^1
+  936|  2.00k|            let k = i % UNIQUE_KEYS;
+  937|  2.00k|            let key = kh(k as u8);
+  938|  2.00k|            let lba = 0x1000 + (i as u64 * 8);
+  939|  2.00k|            let len = ((i % 4096) + 1) as u32;
+  940|  2.00k|            assert!(txm.put(key, lba, len).is_ok());
+  941|  2.00k|            expected[k] = true;
+  942|       |        }
+  943|       |
+  944|     64|        for k in 0..DELETE_OPS {
+                               ^1
+  945|     64|            let key = kh(k as u8);
+  946|     64|            assert!(txm.delete(key).is_ok());
+  947|     64|            expected[k] = false;
+  948|       |        }
+  949|       |
+  950|      1|        assert_eq!(txm.status(), TxStatus::Committed);
+  951|      1|        assert_eq!(txm.epoch(), PUT_OPS + DELETE_OPS);
+  952|       |
+  953|    128|        for (k, present) in expected.iter().enumerate().take(UNIQUE_KEYS) {
+                                          ^1       ^1     ^1          ^1
+  954|    128|            let entry = txm.get_object(&kh(k as u8));
+  955|    128|            assert_eq!(entry.is_some(), *present);
+  956|       |        }
+  957|       |
+  958|      1|        let recovered: AtomicTransactionManager<'_, _, 256, 256> =
+  959|      1|            AtomicTransactionManager::new(&dev);
+  960|      1|        recovered.recover();
+  961|    128|        for (k, present) in expected.iter().enumerate().take(UNIQUE_KEYS) {
+                                          ^1       ^1     ^1          ^1
+  962|    128|            let entry = recovered.get_object(&kh(k as u8));
+  963|    128|            assert_eq!(entry.is_some(), *present);
+  964|       |        }
+  965|      1|    }
+  966|       |
+  967|       |    #[test]
+  968|      1|    fn test_phase4_epoch_is_monotonic_under_updates() {
+  969|      1|        let dev: InMemoryWalDevice<512> = InMemoryWalDevice::new();
+  970|      1|        let txm: AtomicTransactionManager<'_, _, 64, 64> = AtomicTransactionManager::new(&dev);
+  971|       |
+  972|      1|        let mut last_epoch = txm.epoch();
+  973|    200|        for i in 0..200 {
+                               ^1
+  974|    200|            let key = kh((i % 32) as u8);
+  975|    200|            assert!(txm.put(key, 0x2000 + i as u64, 32).is_ok());
+  976|    200|            let current = txm.epoch();
+  977|    200|            assert!(current >= last_epoch);
+  978|    200|            last_epoch = current;
+  979|    200|            assert_eq!(txm.status(), TxStatus::Committed);
+  980|       |        }
+  981|      1|        assert_eq!(last_epoch, 200);
+  982|      1|    }
+  983|       |
+  984|       |    #[test]
+  985|      1|    fn test_storage_error_and_default_paths_for_coverage() {
+  986|      1|        let _ = InMemoryWalDevice::<1>::default();
+  987|      1|        let _ = CowObjectIndex::<1>::default();
+  988|      1|        let _ = BTreeNode::<1>::default();
+  989|      1|        let _ = CowBTreeIndex::<1>::default();
+  990|       |
+  991|      1|        let rec = WalRecord::put(1, kh(1), 7, 3);
+  992|      1|        let mut raw = rec.encode();
+  993|      1|        raw[4] = 0xFF;
+  994|      1|        assert!(WalRecord::decode(&raw).is_none());
+  995|       |
+  996|      1|        let mut raw = rec.encode();
+  997|      1|        raw[60] ^= 0x11;
+  998|      1|        assert!(WalRecord::decode(&raw).is_none());
+  999|       |
+ 1000|      1|        let mut raw = rec.encode();
+ 1001|      1|        raw[6] = 9;
+ 1002|      1|        let checksum = checksum32(&raw[..60]);
+ 1003|      1|        raw[60..64].copy_from_slice(&checksum.to_le_bytes());
+ 1004|      1|        assert!(WalRecord::decode(&raw).is_none());
+ 1005|       |
+ 1006|      1|        let dev: InMemoryWalDevice<1> = InMemoryWalDevice::new();
+ 1007|      1|        let mut buf = [0u8; WAL_BLOCK_SIZE];
+ 1008|      1|        assert!(!dev.read_block(99, &mut buf));
+ 1009|      1|        assert!(!dev.write_block(99, &[0u8; WAL_BLOCK_SIZE]));
+ 1010|       |
+ 1011|      1|        let wal = WriteAheadLog::new(&dev);
+ 1012|      1|        assert!(wal.append(rec).is_some());
+ 1013|      1|        assert!(wal.append(rec).is_none());
+ 1014|      1|        assert!(!wal.commit(99));
+ 1015|       |
+ 1016|      1|        let faulty_write: FaultyWalDevice<2> = FaultyWalDevice::new(None, Some(0));
+ 1017|      1|        let wal_faulty_write = WriteAheadLog::new(&faulty_write);
+ 1018|      1|        assert!(wal_faulty_write.append(rec).is_none());
+ 1019|       |
+ 1020|      1|        let faulty_read: FaultyWalDevice<2> = FaultyWalDevice::new(Some(0), None);
+ 1021|      1|        let wal_faulty_read = WriteAheadLog::new(&faulty_read);
+ 1022|      1|        assert!(wal_faulty_read.append(rec).is_some());
+ 1023|      1|        assert!(!wal_faulty_read.commit(0));
+ 1024|      1|        let mut replayed = 0usize;
+ 1025|      1|        wal_faulty_read.replay_committed(|_| replayed += 1);
+ 1026|      1|        assert_eq!(replayed, 0);
+ 1027|      1|        assert_eq!(wal_faulty_read.recover_head(), 0);
+ 1028|       |
+ 1029|      1|        let faulty_decode: FaultyWalDevice<2> = FaultyWalDevice::new(None, None);
+ 1030|      1|        let wal_faulty_decode = WriteAheadLog::new(&faulty_decode);
+ 1031|      1|        assert!(wal_faulty_decode.append(rec).is_some());
+ 1032|      1|        faulty_decode.write_raw(0, [0u8; WAL_BLOCK_SIZE]);
+ 1033|      1|        assert!(!wal_faulty_decode.commit(0));
+ 1034|       |
+ 1035|      1|        let idx: CowObjectIndex<1> = CowObjectIndex::new();
+ 1036|      1|        assert!(idx.upsert(ObjectEntry {
+ 1037|      1|            key_hash: kh(1),
+ 1038|      1|            lba: 1,
+ 1039|      1|            len: 1,
+ 1040|      1|        }));
+ 1041|      1|        assert!(!idx.upsert(ObjectEntry {
+ 1042|      1|            key_hash: kh(2),
+ 1043|      1|            lba: 2,
+ 1044|      1|            len: 2,
+ 1045|      1|        }));
+ 1046|      1|        assert!(!idx.delete(&kh(3)));
+ 1047|       |
+ 1048|      1|        let mut node: BTreeNode<1> = BTreeNode::new();
+ 1049|      1|        assert!(node.insert_sorted(BTreeNodeEntry {
+ 1050|      1|            key_hash: kh(1),
+ 1051|      1|            lba: 1,
+ 1052|      1|        }));
+ 1053|      1|        assert!(!node.insert_sorted(BTreeNodeEntry {
+ 1054|      1|            key_hash: kh(2),
+ 1055|      1|            lba: 2,
+ 1056|      1|        }));
+ 1057|      1|        assert!(!node.delete(&kh(3)));
+ 1058|      1|        assert_eq!(node.entries().len(), 1);
+ 1059|       |
+ 1060|      1|        let mut broken: BTreeNode<2> = BTreeNode::new();
+ 1061|      1|        broken.force_hole_for_test();
+ 1062|      1|        assert!(!broken.delete(&kh(1)));
+ 1063|       |
+ 1064|      1|        assert_eq!(TxStatus::from_usize(1), TxStatus::InFlight);
+ 1065|      1|        assert_eq!(TxStatus::from_usize(3), TxStatus::Aborted);
+ 1066|      1|        assert_eq!(TxStatus::from_usize(99), TxStatus::Idle);
+ 1067|      1|        assert_eq!(TxStatus::Aborted.as_usize(), 3);
+ 1068|       |
+ 1069|      1|        let dev_full: InMemoryWalDevice<0> = InMemoryWalDevice::new();
+ 1070|      1|        let txm_full: AtomicTransactionManager<'_, _, 1, 1> =
+ 1071|      1|            AtomicTransactionManager::new(&dev_full);
+ 1072|      1|        let put_full = txm_full.put(kh(9), 9, 9);
+ 1073|      1|        assert!(matches!(put_full, Err(TxError::WalFull)));
+                              ^0
+ 1074|      1|        let del_full = txm_full.delete(kh(9));
+ 1075|      1|        assert!(matches!(del_full, Err(TxError::WalFull)));
+                              ^0
+ 1076|       |
+ 1077|      1|        let dev_commit_fail: FaultyWalDevice<4> = FaultyWalDevice::new(Some(0), None);
+ 1078|      1|        let txm_commit_fail: AtomicTransactionManager<'_, _, 2, 2> =
+ 1079|      1|            AtomicTransactionManager::new(&dev_commit_fail);
+ 1080|      1|        assert!(matches!(
+                              ^0
+ 1081|      1|            txm_commit_fail.put(kh(4), 4, 4),
+ 1082|       |            Err(TxError::CommitFailed)
+ 1083|       |        ));
+ 1084|       |
+ 1085|      1|        let dev_commit_fail_delete: FaultyWalDevice<4> = FaultyWalDevice::new(Some(0), None);
+ 1086|      1|        let txm_commit_fail_delete: AtomicTransactionManager<'_, _, 2, 2> =
+ 1087|      1|            AtomicTransactionManager::new(&dev_commit_fail_delete);
+ 1088|      1|        assert!(matches!(
+                              ^0
+ 1089|      1|            txm_commit_fail_delete.delete(kh(4)),
+ 1090|       |            Err(TxError::CommitFailed)
+ 1091|       |        ));
+ 1092|       |
+ 1093|      1|        let dev_index_fail: InMemoryWalDevice<8> = InMemoryWalDevice::new();
+ 1094|      1|        let txm_index_fail: AtomicTransactionManager<'_, _, 1, 8> =
+ 1095|      1|            AtomicTransactionManager::new(&dev_index_fail);
+ 1096|      1|        assert!(txm_index_fail.put(kh(1), 1, 1).is_ok());
+ 1097|      1|        assert!(matches!(
+                              ^0
+ 1098|      1|            txm_index_fail.put(kh(2), 2, 2),
+ 1099|       |            Err(TxError::IndexUpdateFailed)
+ 1100|       |        ));
+ 1101|       |
+ 1102|      1|        let dev_btree_fail: InMemoryWalDevice<8> = InMemoryWalDevice::new();
+ 1103|      1|        let txm_btree_fail: AtomicTransactionManager<'_, _, 8, 1> =
+ 1104|      1|            AtomicTransactionManager::new(&dev_btree_fail);
+ 1105|      1|        assert!(txm_btree_fail.put(kh(1), 1, 1).is_ok());
+ 1106|      1|        assert!(matches!(
+                              ^0
+ 1107|      1|            txm_btree_fail.put(kh(2), 2, 2),
+ 1108|       |            Err(TxError::IndexUpdateFailed)
+ 1109|       |        ));
+ 1110|      1|    }
+ 1111|       |}

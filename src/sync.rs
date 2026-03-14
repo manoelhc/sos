@@ -30,8 +30,10 @@ impl Spinlock {
         {
             let flags: usize;
             unsafe {
+                // Save RFLAGS then disable local interrupts (CLI).
                 core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nostack));
             }
+            // Bit 9 stores IF (Interrupt Flag); caller uses it for restoration.
             flags & 0x200
         }
     }
@@ -48,6 +50,7 @@ impl Spinlock {
         {
             if flags & 0x200 != 0 {
                 unsafe {
+                    // Re-enable interrupts only if they were enabled before lock acquisition.
                     core::arch::asm!("sti", options(nostack));
                 }
             }
@@ -55,20 +58,24 @@ impl Spinlock {
     }
 
     pub fn lock(&self) {
+        // Disable interrupts before entering CAS loop to avoid IRQ re-entrancy deadlocks.
         let mut saved_flags = Self::disable_interrupts();
         while self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            // Briefly restore state while spinning to avoid starving interrupt handling.
             Self::restore_interrupts(saved_flags);
             core::hint::spin_loop();
             saved_flags = Self::disable_interrupts();
         }
+        // Store exact pre-lock IRQ state for symmetric unlock restoration.
         self.irq_flags.store(saved_flags, Ordering::Release);
     }
 
     pub fn unlock(&self) {
+        // Grab saved state first, release lock, then restore interrupts.
         let saved_flags = self.irq_flags.swap(0, Ordering::AcqRel);
         self.locked.store(false, Ordering::Release);
         Self::restore_interrupts(saved_flags);
@@ -146,6 +153,7 @@ impl AtomicSlabBitmap {
             return false;
         }
         let mask = 1usize << index;
+        // `fetch_or` returns old value; bit was free only if it was previously 0.
         self.bitmap.fetch_or(mask, Ordering::AcqRel) & mask == 0
     }
 
@@ -155,6 +163,7 @@ impl AtomicSlabBitmap {
         }
         let mask = 1usize << index;
         let old = self.bitmap.fetch_and(!mask, Ordering::AcqRel);
+        // True means we actually released an allocated slot.
         old & mask != 0
     }
 

@@ -6,9 +6,30 @@ edition = "2021"
 [features]
 default = []
 std = []
+tls13 = ["dep:embedded-tls", "dep:rand_core", "dep:embedded-io"]
+crypto = ["dep:hkdf", "dep:sha2", "dep:chacha20poly1305"]
+lib-panic = []
 
 [dependencies]
 spin = "0.9"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "log",
+    "alloc",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+] }
+embedded-tls = { version = "0.18", default-features = false, optional = true }
+rand_core = { version = "0.6", default-features = false, optional = true }
+embedded-io = { version = "0.7", default-features = false, optional = true }
+hkdf = { version = "0.12", default-features = false, optional = true }
+sha2 = { version = "0.10", default-features = false, optional = true }
+chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
+
+[dev-dependencies]
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 
 [lib]
 crate-type = ["staticlib", "rlib"]
@@ -16,4 +37,13 @@ crate-type = ["staticlib", "rlib"]
 [[bin]]
 name = "sos"
 path = "src/bin/main.rs"
-required-features = []
+
+[[bin]]
+name = "mkfs-sosfs"
+path = "src/bin/mkfs_sosfs.rs"
+required-features = ["std", "crypto"]
+
+[[bin]]
+name = "fsck-sosfs"
+path = "src/bin/fsck_sosfs.rs"
+required-features = ["std"]

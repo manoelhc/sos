@@ -329,24 +329,15 @@ The S.O.S. bootloader injects the ELF kernel into virtualized RAM, allowing engi
 * **Storage Volatility Simulation:** To empirically validate the atomicity of the Write-Ahead Log (WAL) and the stability of the B-Tree index, raw block devices must be attached to the QEMU instance simulating NVMe drives. The testbed scripts must randomly initiate hard power-offs (simulating severe hardware failure) during active, high-throughput file stream writes. Upon subsequent boot, the automated test suite must query the storage engine to confirm that the WAL successfully executed deterministic recovery without any data corruption.  
 * **Memory Coalescing Audits:** The automated test runner must utilize memory profiling tools mapped to the kernel's memory space to monitor the Buddy and Slab allocators. By repeatedly opening and closing thousands of simulated TCP streams, the test ensures that the physical pages are properly coalescing via the XOR algorithmic logic, and that no memory leakage occurs over prolonged uptimes.
 
-## **10\. Deployment Topology and Latency Optimization**
+## **10\. Product Direction Update**
 
-While the S.O.S. software architecture is mathematically optimized for zero-overhead performance, physical network latency—dictated by the geographical distance and routing efficiency between cloud data centers and edge clients—remains a rigid constraint. The stated operational requirement involves deployment concerning the São Paulo and Limeira regions of Brazil. Consequently, an exhaustive topological analysis of hyperscale cloud providers within South America is necessary to minimize Round-Trip Time (RTT).
+S.O.S. is no longer targeting cloud deployment as a primary roadmap objective. The immediate priorities now focus on operating-system-native storage, practical network usability, and deterministic post-boot readiness validation.
 
-| Cloud Provider | Primary Brazilian Region | Secondary Intra-Country Region | Relevant Interconnect Metrics |
-| :---- | :---- | :---- | :---- |
-| **Amazon Web Services (AWS)** | South America (São Paulo) sa-east-1 | None Available | Highly variable dependent on edge ISP routing. |
-| **Google Cloud Platform (GCP)** | São Paulo southamerica-east1 | None Available | Leverages Google global multi-shard network. |
-| **Microsoft Azure** | Brazil South (São Paulo) | None Available | \~2ms latency to interconnected OCI resources. |
-| **Oracle Cloud (OCI)** | Brazil East (São Paulo) | Brazil Southeast (Vinhedo) | 1ms latency between SP and Vinhedo via dedicated fiber. |
+The next stages must prioritize:
 
-**Architectural Insight and Deployment Strategy:**
-
-The analysis indicates that Oracle Cloud Infrastructure (OCI) currently maintains a distinct geographical and topological advantage for deployments targeting the interior of São Paulo state. Unlike AWS, GCP, and Azure, which consolidate their infrastructure exclusively within the metropolitan center of São Paulo, OCI uniquely operates dual, distinct hyperscale regions within Brazil: one in São Paulo and a secondary region in Vinhedo.
-
-The Vinhedo data center is geographically highly proximate to the Campinas and Limeira technological corridors. Furthermore, major local edge infrastructure providers (such as Cirion Technologies and Ascenty) maintain direct Points of Presence (POPs) bridging the Limeira region to the cloud backbones. Ascenty metrics confirm that utilizing their direct fiber interconnects allows localized workloads to interface with the OCI Vinhedo region at a staggering latency of just 1.0 to 1.2 milliseconds.
-
-Therefore, provisioning the S.O.S. bare-metal instances within the OCI Vinhedo region will drastically reduce edge-to-core packet latency. This topological proximity directly enhances the software architecture: lower latency reduces the requisite size of the TCP Window Scaling buffers managed by smoltcp. By minimizing the necessary buffer size, the kernel conserves critical Slab allocator memory, allowing the server blade to support a exponentially higher density of concurrent data streams without exhausting available physical RAM. Furthermore, OCI maintains a direct, high-throughput interconnect with Microsoft Azure in the Campinas region (clocking sub-2ms RTT), enabling seamless, multi-cloud data replication for absolute disaster recovery.
+1. A dedicated S.O.S. filesystem format and formatting toolchain.
+2. Core network libraries sufficient for external HTTPS connectivity.
+3. Automated post-boot system checks for network and internet readiness.
 
 ## **11\. Refined Development Roadmap**
 
@@ -358,7 +349,9 @@ The development roadmap must be restructured to accommodate the severe complexit
 | **Phase 2: Network Stack Integration** | 5 Weeks | Bare-metal VirtIO network drivers, integration of smoltcp with zero-copy DMA, TCP Window Scaling negotiation, embedded-tls 1.3 protocol handshake logic. | QEMU TAP interfaces, VirtIO PCI specs, Wireshark packet analysis. |
 | **Phase 3: Cryptography & Storage** | 6 Weeks | Implementation of HKDF Extract/Expand for Path Patterns, chacha20poly1305-nostd for payload AEAD. Write-Ahead Log (WAL) persistence, lock-free Copy-on-Write (CoW) B-Tree engine. | nostd\_cow, raw block device emulation in QEMU, cryptography audit vectors. |
 | **Phase 4: Hardening & Verification** | 4 Weeks | Atomic transaction integration, lock-free Compare-And-Swap (CAS) optimization, rigorous validation of memory orderings (Acquire/Release). | KernMiri (UB Detection), high-load throughput stress testing. |
-| **Phase 5: Cloud Deployment** | 3 Weeks | Bare-metal provisioning within OCI Vinhedo. Edge latency routing configurations targeting the Limeira POPs. | Hardware load balancers, BGP route monitoring, hardware stress testing. |
+| **Phase 5: Native Filesystem & Formatting Tooling** | 5 Weeks | Design and implement an S.O.S.-specific filesystem format; provide partition formatting/check tools (external tool allowed); enforce object versioning and default encryption; OS must detect and mount/use this partition format. Default filesystem passkey: `sha256("sos")`. | Raw block image tooling, QEMU disk images, filesystem fuzz tests, format verification utilities. |
+| **Phase 6: Practical Network Userland Foundations** | 4 Weeks | Implement network libraries sufficient for external HTTPS usage: DNS resolution, CA trust handling, and core client protocol glue for common internet endpoints. | Packet capture tooling, public CA bundle management, endpoint interoperability tests. |
+| **Phase 7: Post-Boot Readiness System Tests** | 3 Weeks | Add automated boot-time/system-test suite validating operational readiness: ICMP ping reachability, DNS lookup, and HTTPS connectivity to common external targets (e.g., github.com, google.com). | QEMU integration harness, deterministic boot scripts, network diagnostics and retry/timeout analysis. |
 
 ## **12\. Security & Risk Mitigation Checklist**
 
@@ -376,7 +369,7 @@ The risk matrix must align precisely with the structural vulnerabilities inheren
 
 The transition of the Streamed-Object OS (S.O.S.) from a conceptual outline to an exhaustive technical blueprint secures its viability as a next-generation, high-velocity data engine. By abandoning the historically flawed micro-kernel and monolithic paradigms in favor of a mathematically verified Framekernel architecture, the system achieves maximum theoretical throughput while successfully isolating the memory-safety Trusted Computing Base. The strategic fusion of specialized, lockless memory allocators (Buddy and Slab) with the zero-copy DMA capabilities of the smoltcp stack enables continuous gigabit streaming directly from physical hardware without the throttling overhead of a conventional operating system.
 
-Furthermore, by anchoring the conceptual "Path Pattern Encryption" to rigid cryptographic standards (HKDF and ChaCha20-Poly1305 AEAD), and underpinning the entire storage matrix with an append-only Write-Ahead Log, the S.O.S. provides an inherently immutable, ACID-compliant storage environment. When deployed within optimized geographical topologies—specifically targeting the ultra-low latency fiber interconnects available within the Brazilian Vinhedo/Limeira technological corridor—the S.O.S. architecture represents a definitively secure, infinitely scalable solution for real-time object streaming.
+Furthermore, by anchoring the conceptual "Path Pattern Encryption" to rigid cryptographic standards (HKDF and ChaCha20-Poly1305 AEAD), and underpinning the entire storage matrix with an append-only Write-Ahead Log, the S.O.S. provides an inherently immutable, ACID-compliant storage environment. The next evolution of the architecture now centers on an OS-native encrypted/versioned filesystem, practical HTTPS-capable networking foundations, and deterministic post-boot readiness validation.
 
 #### **Works cited**
 
