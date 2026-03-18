@@ -9,7 +9,6 @@ use core::cell::UnsafeCell;
 
 pub struct BuddyAllocator {
     base: usize,
-    total_size: usize,
     max_order: usize,
     free_lists: [UnsafeCell<FreeList>; MAX_ORDERS],
 }
@@ -91,7 +90,6 @@ impl BuddyAllocator {
         {
             let mut allocator = Box::new(BuddyAllocator {
                 base: base_addr,
-                total_size: size,
                 max_order,
                 free_lists: [const { UnsafeCell::new(FreeList::new()) }; MAX_ORDERS],
             });
@@ -99,20 +97,18 @@ impl BuddyAllocator {
                 allocator.free_lists[order].get_mut().head = 0;
             }
             allocator.free_lists[max_order].get_mut().head = base_addr;
-            return Box::leak(allocator);
+            Box::leak(allocator)
         }
 
         #[cfg(not(test))]
         {
             static mut ALLOCATOR: BuddyAllocator = BuddyAllocator {
                 base: 0,
-                total_size: 0,
                 max_order: 0,
                 free_lists: [const { UnsafeCell::new(FreeList::new()) }; MAX_ORDERS],
             };
 
             ALLOCATOR.base = base_addr;
-            ALLOCATOR.total_size = size;
             ALLOCATOR.max_order = max_order;
             for order in 0..MAX_ORDERS {
                 ALLOCATOR.free_lists[order].get_mut().head = 0;

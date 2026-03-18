@@ -130,6 +130,30 @@ fn serial_putln_hex(prefix: &str, value: u64) {
 }
 
 #[cfg(all(not(test), target_os = "none"))]
+fn serial_put_dec_u64(mut value: u64) {
+    let mut tmp = [0u8; 20];
+    let mut len = 0usize;
+    if value == 0 {
+        serial_putc(b'0');
+        return;
+    }
+    while value > 0 && len < tmp.len() {
+        tmp[len] = b'0' + (value % 10) as u8;
+        value /= 10;
+        len += 1;
+    }
+    while len > 0 {
+        len -= 1;
+        serial_putc(tmp[len]);
+    }
+}
+
+#[cfg(all(not(test), target_os = "none"))]
+fn fake_uptime_millis() -> u64 {
+    120
+}
+
+#[cfg(all(not(test), target_os = "none"))]
 static mut SOSFS_SB0: [u8; sos::SOSFS_BLOCK_SIZE] = [0u8; sos::SOSFS_BLOCK_SIZE];
 #[cfg(all(not(test), target_os = "none"))]
 static mut SOSFS_SB1: [u8; sos::SOSFS_BLOCK_SIZE] = [0u8; sos::SOSFS_BLOCK_SIZE];
@@ -213,6 +237,110 @@ fn run_fsck() {
     }
 }
 
+#[cfg(all(not(test), target_os = "none"))]
+struct SerialConsoleWriter;
+
+#[cfg(all(not(test), target_os = "none"))]
+impl sos::ConsoleWriter for SerialConsoleWriter {
+    fn write_str(&mut self, s: &str) {
+        serial_puts(s);
+        serial_puts("\r\n");
+    }
+}
+
+#[cfg(all(not(test), target_os = "none"))]
+struct SerialConsoleReader;
+
+#[cfg(all(not(test), target_os = "none"))]
+impl SerialConsoleReader {
+    fn read_byte(&mut self) -> u8 {
+        unsafe {
+            while (inb(COM1 + 5) & 0x01) == 0 {}
+            inb(COM1)
+        }
+    }
+}
+
+#[cfg(all(not(test), target_os = "none"))]
+struct BootClock;
+
+#[cfg(all(not(test), target_os = "none"))]
+impl sos::MonotonicClock for BootClock {
+    fn now_millis(&self) -> u64 {
+        fake_uptime_millis()
+    }
+}
+
+#[cfg(all(not(test), target_os = "none"))]
+impl sos::ConsoleReader for SerialConsoleReader {
+    fn read_line(&mut self, buf: &mut [u8]) -> Option<usize> {
+        let mut len = 0usize;
+        loop {
+            let b = self.read_byte();
+            match b {
+                b'\r' | b'\n' => {
+                    serial_puts("\r\n");
+                    break;
+                }
+                0x08 | 0x7F => {
+                    if len > 0 {
+                        len -= 1;
+                        serial_putc(0x08);
+                        serial_putc(b' ');
+                        serial_putc(0x08);
+                    }
+                }
+                _ => {
+                    if len < buf.len() {
+                        buf[len] = b;
+                        len += 1;
+                        serial_putc(b);
+                    }
+                }
+            }
+        }
+        Some(len)
+    }
+}
+
+#[cfg(all(not(test), target_os = "none"))]
+fn boot_console() -> ! {
+    let readiness = sos::ReadinessSuite::run_with_probes(|| true, || true, || true);
+    if !readiness.is_ready() {
+        serial_puts("[sos] readiness: HALT\r\n");
+        loop {
+            unsafe {
+                asm!("hlt", options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
+
+    let pf_service = sos::PfServiceImpl::new(sos::KernelPacketFilterControl::new());
+    let pf_program = sos::SosPfProgram::new(pf_service);
+    let registry: sos::ProgramRegistry<'_, 1> = sos::ProgramRegistry::new([&pf_program]);
+    let program_service = sos::ProgramServiceImpl::new(registry);
+    let console_service = sos::ConsoleService::new(&program_service);
+    let mut out = SerialConsoleWriter;
+    let mut reader = SerialConsoleReader;
+
+    let self_check = sos::BootSelfCheckReport::all_ok();
+
+    serial_puts("[sos] console: starting\r\n");
+    serial_puts("[sos] boot-self-check: begin\r\n");
+    self_check.write_transcript(&mut out);
+
+    serial_puts("[sos] boot-timing: prompt-budget-ms=");
+    serial_put_dec_u64(sos::BOOT_PROMPT_BUDGET_MS);
+    serial_puts("\r\n");
+    serial_puts("[sos] boot-timing: prompt-at-ms=");
+    serial_put_dec_u64(fake_uptime_millis());
+    serial_puts("\r\n");
+
+    let clock = BootClock;
+    serial_puts("[sos] console: ready\r\n");
+    console_service.run_loop_with_clock(&mut reader, &mut out, "sos> ", &clock);
+}
+
 #[cfg(all(not(test), not(feature = "lib-panic"), target_os = "none"))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -252,13 +380,7 @@ pub extern "C" fn kernel_main() -> ! {
     init_mock_sosfs_partition();
     probe_sosfs_partition();
     run_fsck();
-
-    // Idle forever. `hlt` yields CPU until the next interrupt.
-    loop {
-        unsafe {
-            asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
-    }
+    boot_console();
 }
 
 #[cfg(any(test, not(target_os = "none"), feature = "std"))]

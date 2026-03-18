@@ -23,7 +23,7 @@ impl Spinlock {
     fn disable_interrupts() -> usize {
         #[cfg(test)]
         {
-            return 0x200;
+            0x200
         }
 
         #[cfg(not(test))]
@@ -43,7 +43,6 @@ impl Spinlock {
         #[cfg(test)]
         {
             let _ = flags;
-            return;
         }
 
         #[cfg(not(test))]

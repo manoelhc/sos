@@ -1,8 +1,9 @@
 # Architecture Notes
 
 This document maps the current repository implementation to the S.O.S.
-framekernel roadmap, including completed Phase 2 networking and Phase 3
-cryptography/storage foundations.
+framekernel roadmap, including completed Phase 2 networking, Phase 3
+cryptography/storage foundations, and initial Phase 7/8 userland-control
+surfaces.
 
 ## Module map
 
@@ -23,6 +24,8 @@ flowchart TD
     NET --> VIRTIO[virtio.rs]
     NET --> STACK[stack.rs]
     NET --> TLS[tls.rs]
+    NET --> READY[readiness.rs]
+    LIB --> PF[pf]
 
     VIRTIO --> STACK
     STACK --> TLS
@@ -265,3 +268,78 @@ flowchart TD
     Clean -- yes --> Ready[sosfs usable]
     Clean -- no --> Halt[HALT on corrupt]
 ```
+
+## Phase 7 post-boot readiness checks (implemented)
+
+- Readiness suite in `src/network/readiness.rs` models deterministic checks:
+  ICMP reachability, DNS resolution path, and HTTPS connectivity gate.
+- `sos-readiness` CLI (`src/bin/sos_readiness.rs`) executes the suite and
+  returns non-zero when readiness is not achieved.
+- Tests cover all-pass and partial-failure scenarios to enforce gate semantics.
+
+## Phase 8 `sos-pf` packet filter control plane (implemented)
+
+- YAML schema and validation in `src/pf/mod.rs`:
+  - root `sos-pf.tables[]`
+  - table family validation (`ip`, `ip6`, `inet`, `arp`, `bridge`, `netdev`)
+  - chain type/hook/policy validation
+  - sets/maps schema and reference validation
+  - payload/conntrack match validation
+  - action validation (`accept`, `drop`, `reject`, `log`, `snat`, `dnat`,
+    `masquerade`, `redirect`, `limit`)
+- Atomic apply planning:
+  - full nft batch script generation (`flush ruleset` + add table/set/map/chain/rule)
+  - NAT, rate-limit, conntrack, payload, and set-reference rule rendering
+- Runtime integrations:
+  - dry-run preflight via `nft -c -f -`
+  - apply via `nft -f -`
+  - kernel ruleset export via `nft -j list ruleset` + JSON->YAML bridge
+- `sos-pf` CLI (`src/bin/sos_pf.rs`):
+  - `check --config <path>` for dry-run schema + kernel parsing validation
+  - `apply --config <path>` for atomic transaction application
+  - `export --config <path>` for YAML export/canonicalization path
+  - `export-running` for live kernel state export to `sos-pf` YAML
+- Tests follow TDD and cover parser/schema, apply plan rendering, runner-based
+  dry-run/apply behavior, and ruleset JSON export mapping.
+
+## Phase 9 console bring-up and service boundaries (implemented initial scope)
+
+- Interactive serial console starts automatically during boot after fsck.
+- Command loop provides prompt-driven dispatch (`sos> `) with line input,
+  backspace handling, and command execution result reporting.
+- Builtin shell-level commands (`help`, `programs`) are resolved by
+  `ConsoleService` without crossing privileged service boundaries.
+- Service layering in `src/console/mod.rs`:
+  - `ConsoleService` (command parsing + loop)
+  - `ProgramService` (program dispatch boundary)
+  - `PfService` (`sos-pf` control boundary)
+- Kernel-side `PacketFilterControl` now keeps runtime policy state (applied/staged
+  + generation counter) behind a mutex-protected control object, so console-level
+  execution never writes hardware/control state directly.
+- `sos-pf status` is now a dedicated message path (`PfMessage::Status`) to query
+  runtime state without conflating it with export payloads.
+
+## Phase 10-13 execution/runtime hardening (implemented in current scope)
+
+- Program metadata/ABI descriptor is now explicit (`ProgramDescriptor`, `ProgramAbi`)
+  and queryable via console (`help <program>`).
+- Program lifecycle supervision contracts are implemented in `ProgramService`:
+  `Spawn`, `Wait`, and `Terminate`, with task-handle tracking.
+- Process-isolation primitives now live in `src/process/mod.rs`:
+  - isolated address-space descriptors with non-overlap assertions
+  - process runtime with spawn/load/map/context-install/switch/terminate paths
+  - executable header parser (`SOSX`) carrying ABI and entry metadata
+  - bounded IPC bus with endpoint registration and routed message queues
+  - virtual-memory context operation trait (`VmContextOps`) for architecture-specific
+    page mapping and context install hooks
+- Structured machine-readable response codes are emitted (`sos-code: ...`) for
+  successful and failed control operations.
+- Console UX hardening includes bounded command history ring and deterministic
+  fallback messaging (`reader unavailable`, `command failed`).
+- Boot-to-console determinism is instrumented with:
+  - mandatory boot self-check transcript
+  - prompt budget constant (`BOOT_PROMPT_BUDGET_MS`)
+  - prompt-at timing emission in boot logs
+- This preserves framekernel/microkernel intent by separating command parsing,
+  program dispatch, and privileged service actions behind explicit message-like
+  request/response contracts.

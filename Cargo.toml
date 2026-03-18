@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-std = []
+std = ["dep:serde", "dep:serde_yaml", "dep:serde_json"]
 tls13 = ["dep:embedded-tls", "dep:rand_core", "dep:embedded-io"]
 crypto = ["dep:hkdf", "dep:sha2", "dep:chacha20poly1305"]
 lib-panic = []
@@ -26,6 +26,9 @@ embedded-io = { version = "0.7", default-features = false, optional = true }
 hkdf = { version = "0.12", default-features = false, optional = true }
 sha2 = { version = "0.10", default-features = false, optional = true }
 chacha20poly1305 = { version = "0.10", default-features = false, optional = true }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }
+serde_yaml = { version = "0.9", optional = true }
+serde_json = { version = "1", optional = true }
 
 [dev-dependencies]
 rcgen = "0.13"
@@ -46,4 +49,14 @@ required-features = ["std", "crypto"]
 [[bin]]
 name = "fsck-sosfs"
 path = "src/bin/fsck_sosfs.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "sos-pf"
+path = "src/bin/sos_pf.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "sos-readiness"
+path = "src/bin/sos_readiness.rs"
 required-features = ["std"]

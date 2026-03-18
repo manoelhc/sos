@@ -1,4 +1,4 @@
-.PHONY: all build run iso run-iso phase4-stress clean
+.PHONY: all build run iso run-iso phase4-stress phase5-cov clean
 
 TARGET = x86_64-unknown-none
 KERNEL = target/$(TARGET)/release/sos
@@ -28,6 +28,9 @@ run-iso: iso
 
 phase4-stress:
 	./scripts/phase4-stress.sh $(ITER)
+
+phase5-cov:
+	cargo llvm-cov --features "std,crypto" --lib --bin mkfs-sosfs --bin fsck-sosfs --json --summary-only --output-path coverage/phase5-summary.json --ignore-filename-regex '.*/src/(allocator/|crypto/|framekernel.rs|network/|storage/|sync.rs|bin/main.rs|lib.rs)'
 
 clean:
 	cargo clean

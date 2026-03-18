@@ -447,7 +447,7 @@ impl<const FANOUT: usize> BTreeNode<FANOUT> {
         &self.entries[..self.len]
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "crypto"))]
     fn force_hole_for_test(&mut self) {
         assert!(FANOUT > 0);
         self.len = 1;

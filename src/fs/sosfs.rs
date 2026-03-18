@@ -215,8 +215,10 @@ pub fn validate_superblock(
         return Err(SosfsFsckIssue::BadFlags);
     }
 
-    let fs_uuid = [0u8; 16];
-    let fs_salt = [0u8; 32];
+    let mut fs_uuid = [0u8; 16];
+    fs_uuid.copy_from_slice(&block[24..40]);
+    let mut fs_salt = [0u8; 32];
+    fs_salt.copy_from_slice(&block[40..72]);
     let active_generation = u64::from_le_bytes([
         block[72], block[73], block[74], block[75], block[76], block[77], block[78], block[79],
     ]);
@@ -270,7 +272,7 @@ pub fn fsck_superblock_pair(
                 };
             }
 
-            if i0.fs_uuid != i1.fs_uuid {
+            if i0.fs_uuid != i1.fs_uuid || i0.fs_salt != i1.fs_salt || i0.flags != i1.flags {
                 report = report.with_issue(SosfsFsckIssue::MirrorMismatch);
                 report.status = if strict {
                     SosfsFsckStatus::Corrupt
@@ -506,8 +508,7 @@ mod tests {
         assert_eq!(report.status, SosfsFsckStatus::Warn);
         assert!(report
             .issues
-            .iter()
-            .any(|&x| x == Some(SosfsFsckIssue::GenerationMismatch)));
+            .contains(&Some(SosfsFsckIssue::GenerationMismatch)));
 
         let report_strict = fsck_superblock_pair(&sb1, &sb2, true);
         assert_eq!(report_strict.status, SosfsFsckStatus::Corrupt);
@@ -585,5 +586,70 @@ mod tests {
         );
         let result = validate_superblock(&sb);
         assert_eq!(result, Err(SosfsFsckIssue::BadFlags));
+    }
+
+    #[test]
+    fn test_validate_superblock_bad_block_size() {
+        let mut sb = build_superblock(
+            0,
+            1,
+            SOSFS_FLAG_ENCRYPTION_REQUIRED | SOSFS_FLAG_VERSIONING_REQUIRED,
+            [1u8; 16],
+            [2u8; 32],
+            9,
+            2,
+            256,
+            258,
+            128,
+            386,
+            8192,
+            44,
+        );
+        sb[12..16].copy_from_slice(&(2048u32).to_le_bytes());
+        let result = validate_superblock(&sb);
+        assert_eq!(result, Err(SosfsFsckIssue::BadBlockSize));
+    }
+
+    #[test]
+    fn test_fsck_mirror_mismatch_uuid() {
+        let sb1 = build_superblock(
+            0,
+            1,
+            SOSFS_FLAG_ENCRYPTION_REQUIRED | SOSFS_FLAG_VERSIONING_REQUIRED,
+            [1u8; 16],
+            [2u8; 32],
+            9,
+            2,
+            256,
+            258,
+            128,
+            386,
+            8192,
+            44,
+        );
+        let sb2 = build_superblock(
+            0,
+            1,
+            SOSFS_FLAG_ENCRYPTION_REQUIRED | SOSFS_FLAG_VERSIONING_REQUIRED,
+            [3u8; 16],
+            [2u8; 32],
+            9,
+            2,
+            256,
+            258,
+            128,
+            386,
+            8192,
+            44,
+        );
+
+        let report = fsck_superblock_pair(&sb1, &sb2, false);
+        assert_eq!(report.status, SosfsFsckStatus::Warn);
+        assert!(report
+            .issues
+            .contains(&Some(SosfsFsckIssue::MirrorMismatch)));
+
+        let report_strict = fsck_superblock_pair(&sb1, &sb2, true);
+        assert_eq!(report_strict.status, SosfsFsckStatus::Corrupt);
     }
 }

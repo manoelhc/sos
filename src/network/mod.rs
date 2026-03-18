@@ -5,10 +5,14 @@
 //! - smoltcp integration and socket orchestration (`stack`),
 //! - optional TLS integration wrappers (`tls`).
 
+#[cfg(feature = "std")]
+pub mod readiness;
 pub mod stack;
 pub mod tls;
 pub mod virtio;
 
+#[cfg(feature = "std")]
+pub use readiness::{ReadinessCheck, ReadinessStatus, ReadinessSuite};
 #[cfg(feature = "tls13")]
 pub use stack::{NetworkIoError, NetworkStackIo};
 pub use stack::{

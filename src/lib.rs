@@ -14,15 +14,26 @@
 extern crate std;
 
 pub mod allocator;
+pub mod console;
 #[cfg(feature = "crypto")]
 pub mod crypto;
 pub mod framekernel;
 pub mod fs;
 pub mod network;
+#[cfg(feature = "std")]
+pub mod pf;
+pub mod process;
 pub mod storage;
 pub mod sync;
 
 pub use allocator::{BuddyAllocator, SlabAllocator};
+pub use console::{
+    parse_command_line, BootSelfCheckReport, ConsoleError, ConsoleReader, ConsoleService,
+    ConsoleWriter, KernelPacketFilterControl, MachineErrorCode, MonotonicClock,
+    PacketFilterControl, PfMessage, PfResult, PfService, PfServiceImpl, Program, ProgramAbi,
+    ProgramDescriptor, ProgramHandle, ProgramRegistry, ProgramRequest, ProgramResponse,
+    ProgramService, ProgramServiceImpl, ProgramState, SosPfProgram, BOOT_PROMPT_BUDGET_MS,
+};
 #[cfg(feature = "crypto")]
 pub use crypto::{PathCrypto, DERIVED_KEY_SIZE, NONCE_SIZE, TAG_SIZE};
 pub use framekernel::OSTD;
@@ -36,6 +47,23 @@ pub use network::{
 };
 #[cfg(feature = "tls13")]
 pub use network::{NetworkIoError, NetworkStackIo};
+#[cfg(feature = "std")]
+pub use network::{ReadinessCheck, ReadinessStatus, ReadinessSuite};
+#[cfg(feature = "std")]
+pub use pf::{
+    apply_with_runner as pf_apply_with_runner, build_apply_plan as pf_build_apply_plan,
+    check_config as pf_check_config, dry_run_check_with_runner as pf_dry_run_check_with_runner,
+    export_config_yaml as pf_export_config_yaml,
+    export_running_ruleset_yaml_with_runner as pf_export_running_ruleset_yaml_with_runner,
+    parse_config as pf_parse_config, ruleset_json_to_yaml as pf_ruleset_json_to_yaml, ApplyPlan,
+    NftRunner, PfCheckReport, PfConfig, PfError, SystemNftRunner,
+};
+pub use process::{
+    parse_executable_header, AbiVersion, AddressSpace, CpuContext, ExecutableHeader, IpcBus,
+    IpcEndpoint, IpcMessage, IsolationError, IsolationRuntime,
+    ProcessHandle as IsolatedProcessHandle, ProcessState as IsolatedProcessState, VmContextOps,
+    CONTEXT_SLOT_CAPACITY, IPC_QUEUE_CAPACITY, PROCESS_SLOT_CAPACITY,
+};
 pub use storage::{
     AtomicTransactionManager, BTreeNode, BTreeNodeEntry, CowBTreeIndex, CowObjectIndex,
     InMemoryWalDevice, ObjectEntry, TxError, TxStatus, WalBlockDevice, WalOp, WalRecord,

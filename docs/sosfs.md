@@ -191,7 +191,7 @@ The `fsck-sosfs` tool validates superblock mirrors and reports filesystem health
 
 - **One invalid mirror**: Non-strict = Warn, Strict = Corrupt
 - **Generation mismatch**: Non-strict = Warn, Strict = Corrupt  
-- **UUID mismatch (mirror divergence)**: Non-strict = Warn, Strict = Corrupt
+- **Mirror divergence (UUID/salt/flags mismatch)**: Non-strict = Warn, Strict = Corrupt
 
 ### Boot hard-fail gate
 

@@ -131,10 +131,10 @@ mod tests {
         unsafe { allocator.init(0x1000) };
 
         let mut ptrs = [core::ptr::null_mut(); NUM_OBJECTS];
-        for i in 0..NUM_OBJECTS {
+        for slot in ptrs.iter_mut().take(NUM_OBJECTS) {
             let ptr = unsafe { allocator.alloc() };
             assert!(!ptr.is_null());
-            ptrs[i] = ptr;
+            *slot = ptr;
         }
 
         let ptr = unsafe { allocator.alloc() };
